@@ -1,5 +1,5 @@
 using CSV, DataFrames, Statistics
-using DCM
+using ChoiceModels
 
 # Load dataset and filter SP observations only
 df = CSV.read("../data/apollo_modeChoiceData.csv", DataFrame)

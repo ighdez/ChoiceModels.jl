@@ -1,5 +1,5 @@
 """
-Defines the abstract type DiscreteChoiceModel and the generic interface for models in DCM.jl.
+Defines the abstract type DiscreteChoiceModel and the generic interface for models in ChoiceModels.jl.
 
 This module establishes the base interface all discrete choice models must follow, including predict, loglikelihood, and estimate. Specific models (e.g., Logit, Mixed Logit) must subtype DiscreteChoiceModel and implement these methods.
 """

@@ -1,5 +1,5 @@
 using Test
-using DCM
+using ChoiceModels
 using DataFrames
 
 @testset "LogitModel.jl" begin

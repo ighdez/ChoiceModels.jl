@@ -1,5 +1,5 @@
 using CSV, DataFrames, Statistics
-using DCM
+using ChoiceModels
 
 # Load Swiss route choice dataset
 df = CSV.read("../data/apollo_swissRouteChoiceData.csv", DataFrame)

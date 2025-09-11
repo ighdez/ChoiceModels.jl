@@ -1,6 +1,6 @@
-# DCM.jl — A symbolic, extensible package for estimating Discrete Choice Models in Julia
+# ChoiceModels.jl — A symbolic, extensible package for estimating Discrete Choice Models in Julia
 
-**DCM.jl** is a Julia package designed for flexible and symbolic specification of Discrete Choice Models (DCM). Inspired by **Biogeme** and **Apollo**, it uses symbolic algebra, modular architecture, and Julia's type system to allow rapid prototyping and estimation of models like Logit and Mixed Logit.
+**ChoiceModels.jl** is a Julia package designed for flexible and symbolic specification of Discrete Choice Models (DCM). Inspired by **Biogeme** and **Apollo**, it uses symbolic algebra, modular architecture, and Julia's type system to allow rapid prototyping and estimation of models like Logit and Mixed Logit.
 
 ---
 
@@ -18,7 +18,7 @@
 ## ✨ Quick Example: Estimating a Logit Model
 
 ```julia
-using DCM, CSV, DataFrames
+using ChoiceModels, CSV, DataFrames
 
 df = CSV.read("my_data.csv", DataFrame)
 
@@ -39,7 +39,7 @@ probs = predict(model, results)
 ## 🌀 Example: Estimating a Mixed Logit Model
 
 ```julia
-using DCM, CSV, DataFrames
+using ChoiceModels, CSV, DataFrames
 
 df = CSV.read("my_data.csv", DataFrame)
 
@@ -67,7 +67,7 @@ P = predict(model, results)
 ## 📦 Installation
 
 ```julia
-] dev https://github.com/ighdez/DCM.jl
+] dev https://github.com/ighdez/ChoiceModels.jl
 ```
 
 ---

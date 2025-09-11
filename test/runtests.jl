@@ -1,4 +1,4 @@
-using DCM
+using ChoiceModels
 using Test
 
 include("test_expressions.jl")

@@ -1,5 +1,5 @@
 """
-DCM.jl — A symbolic, extensible package for estimating Discrete Choice Models in Julia.
+ChoiceModels.jl — A symbolic, extensible package for estimating Discrete Choice Models in Julia.
 
 ## Features
 
@@ -12,7 +12,7 @@ DCM.jl — A symbolic, extensible package for estimating Discrete Choice Models 
 ## Example
 
 ```julia
-using DCM
+using ChoiceModels
 
 asc = Parameter(:asc_car, value=0.0)
 β_time = Parameter(:β_time, value=0.0)
@@ -43,7 +43,7 @@ User-facing types and functions, including:
 MIT License
 """
 
-module DCM
+module ChoiceModels
 
 __precompile__()
 

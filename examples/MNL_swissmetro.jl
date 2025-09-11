@@ -1,5 +1,5 @@
 using CSV, DataFrames, Statistics
-using DCM
+using ChoiceModels
 
 # Load dataset and filter RP observations only
 df = CSV.read("../data/swissmetro.dat", DataFrame; delim='\t')
