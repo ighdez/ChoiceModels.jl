@@ -39,4 +39,19 @@ using DataFrames
         @test evaluate(a / b, df, params) ≈ [0.25, 0.25]
     end
 
+    @testset "power (^)" begin
+        b = Parameter(:b, value=0.0)
+        df = DataFrame(x = [2.0, 3.0])
+        params = Dict(:b => 3.0)
+
+        # x ^ 2  →  4, 9
+        @test evaluate(Variable(:x)^2, df, params) ≈ [4.0, 9.0]
+        # b ^ 2  →  9 (broadcast over rows)
+        @test evaluate(b^2, df, params) ≈ [9.0, 9.0]
+        # (b * x) ^ 2  with b = 3  →  36, 81
+        @test evaluate((b * Variable(:x))^2, df, params) ≈ [36.0, 81.0]
+        # collect_parameters must traverse the power's base
+        @test :b in [p.name for p in ChoiceModels.collect_parameters(b^2)]
+    end
+
 end

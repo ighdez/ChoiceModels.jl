@@ -105,14 +105,30 @@ struct DCMMinus{A<:DCMExpression} <: DCMUnary
     arg::A
 end
 
+"""
+Symbolic power of an expression raised to a numeric exponent (`arg ^ exponent`).
+
+Modeled as a `DCMUnary` node (its single symbolic child is `arg`; `exponent` is a
+plain `Real`), so the `collect_*` tree-walkers traverse it automatically.
+
+# Fields
+- `arg`: symbolic base expression
+- `exponent`: numeric exponent
+"""
+struct DCMPower{A<:DCMExpression, E<:Real} <: DCMUnary
+    arg::A
+    exponent::E
+end
+
 # Operator overloads
 
-import Base: ==, +, *, /, exp, log, -
+import Base: ==, +, *, /, ^, exp, log, -
 ==(a::DCMExpression, b::Real) = DCMEqual(a, b)
 +(a::DCMExpression, b::DCMExpression) = DCMSum(a, b)
 -(a::DCMExpression, b::DCMExpression) = DCMDiff(a, b)
 *(a::DCMExpression, b::DCMExpression) = DCMMult(a, b)
 /(a::DCMExpression, b::DCMExpression) = DCMDiv(a, b)
+^(a::DCMExpression, b::Real) = DCMPower(a, b)
 exp(a::DCMExpression) = DCMExp(a)
 log(a::DCMExpression) = DCMLog(a)
 -(a::DCMExpression) = DCMMinus(a)
@@ -129,7 +145,6 @@ log(a::DCMExpression) = DCMLog(a)
 /(a::Real, b::DCMExpression) = DCMLiteral(a) / b
 /(a::DCMExpression, b::Real) = a / DCMLiteral(b)
 
-^(a::DCMExpression, b::Real) = DCMPower(a, b)
 """
 Represents a named parameter in a utility expression.
 
@@ -232,6 +247,7 @@ evaluate(e::DCMDiv,  data::DataFrame, params::AbstractDict) = evaluate(e.left, d
 evaluate(e::DCMExp,   data::DataFrame, params::AbstractDict) = exp.(evaluate(e.arg, data, params))
 evaluate(e::DCMLog,   data::DataFrame, params::AbstractDict) = log.(evaluate(e.arg, data, params))
 evaluate(e::DCMMinus, data::DataFrame, params::AbstractDict) = -evaluate(e.arg, data, params)
+evaluate(e::DCMPower, data::DataFrame, params::AbstractDict) = evaluate(e.arg, data, params) .^ e.exponent
 
 function evaluate(e::DCMEqual, data::DataFrame, params::AbstractDict)
     left_val = evaluate(e.left, data, params)
@@ -297,6 +313,7 @@ _evaluate_draws(e::DCMDiv,  data, params, draws) = Base.broadcasted(/, _evaluate
 _evaluate_draws(e::DCMExp,   data, params, draws) = Base.broadcasted(exp, _evaluate_draws(e.arg, data, params, draws))
 _evaluate_draws(e::DCMLog,   data, params, draws) = Base.broadcasted(log, _evaluate_draws(e.arg, data, params, draws))
 _evaluate_draws(e::DCMMinus, data, params, draws) = Base.broadcasted(-,   _evaluate_draws(e.arg, data, params, draws))
+_evaluate_draws(e::DCMPower, data, params, draws) = Base.broadcasted(^,   _evaluate_draws(e.arg, data, params, draws), e.exponent)
 
 _evaluate_draws(e::DCMEqual, data, params, draws) =
     Base.broadcasted((l, r) -> ifelse(l == r, one(l), zero(l)), _evaluate_draws(e.left, data, params, draws), e.right)
