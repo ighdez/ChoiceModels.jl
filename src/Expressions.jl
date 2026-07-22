@@ -26,9 +26,9 @@ Represents a symbolic equality comparison between an expression and a numeric va
 - `left::DCMExpression`: left-hand side symbolic expression
 - `right::Real`: right-hand side numeric value
 """
-struct DCMEqual <: DCMBinary
-    left::DCMExpression
-    right::Real
+struct DCMEqual{L<:DCMExpression, R<:Real} <: DCMBinary
+    left::L
+    right::R
 end
 
 """
@@ -37,9 +37,9 @@ Symbolic addition of two expressions.
 # Fields
 - `left`, `right`: symbolic expressions
 """
-struct DCMSum <: DCMBinary
-    left::DCMExpression
-    right::DCMExpression
+struct DCMSum{L<:DCMExpression, R<:DCMExpression} <: DCMBinary
+    left::L
+    right::R
 end
 
 """
@@ -48,9 +48,9 @@ Symbolic difference of two expressions.
 # Fields
 - `left`, `right`: symbolic expressions
 """
-struct DCMDiff <: DCMBinary
-    left::DCMExpression
-    right::DCMExpression
+struct DCMDiff{L<:DCMExpression, R<:DCMExpression} <: DCMBinary
+    left::L
+    right::R
 end
 
 """
@@ -59,9 +59,9 @@ Symbolic multiplication of two expressions.
 # Fields
 - `left`, `right`: symbolic expressions
 """
-struct DCMMult <: DCMBinary
-    left::DCMExpression
-    right::DCMExpression
+struct DCMMult{L<:DCMExpression, R<:DCMExpression} <: DCMBinary
+    left::L
+    right::R
 end
 
 """
@@ -70,9 +70,9 @@ Symbolic division of two expressions.
 # Fields
 - `left`, `right`: symbolic expressions
 """
-struct DCMDiv <: DCMBinary
-    left::DCMExpression
-    right::DCMExpression
+struct DCMDiv{L<:DCMExpression, R<:DCMExpression} <: DCMBinary
+    left::L
+    right::R
 end
 
 """
@@ -81,8 +81,8 @@ Symbolic exponential of an expression.
 # Fields
 - `arg`: symbolic expression
 """
-struct DCMExp <: DCMUnary
-    arg::DCMExpression
+struct DCMExp{A<:DCMExpression} <: DCMUnary
+    arg::A
 end
 
 """
@@ -91,8 +91,8 @@ Symbolic logarithm of an expression.
 # Fields
 - `arg`: symbolic expression
 """
-struct DCMLog <: DCMUnary
-    arg::DCMExpression
+struct DCMLog{A<:DCMExpression} <: DCMUnary
+    arg::A
 end
 
 """
@@ -101,8 +101,8 @@ Symbolic negation of an expression (unary minus).
 # Fields
 - `arg`: symbolic expression
 """
-struct DCMMinus <: DCMUnary
-    arg::DCMExpression
+struct DCMMinus{A<:DCMExpression} <: DCMUnary
+    arg::A
 end
 
 # Operator overloads
@@ -264,7 +264,10 @@ random draws, and data variables.
 # up if needed — so `logit_prob`'s `size(utils[j]) == (N, R)` contract holds.
 function evaluate(e::DCMExpression, data::DataFrame, params::AbstractDict, draws::AbstractDict)
     N, R = size(first(values(draws)))
-    return _as_nxr(_evaluate_draws(e, data, params, draws), N, R)
+    # Because the operator nodes are parametric (DCMSum{L,R}, …), the full tree
+    # type is concrete, so this call specializes on that type and the lazy
+    # `Base.broadcasted` chain below fuses into a SINGLE materialized N×R kernel.
+    return _as_nxr(Base.Broadcast.materialize(_evaluate_draws(e, data, params, draws)), N, R)
 end
 
 # Broadcast a scalar/vector result up to N×R; pass an already-N×R matrix through.
@@ -275,32 +278,27 @@ function _as_nxr(v, N::Int, R::Int)
     return out
 end
 
-# Leaves — natural shape, no N×R materialization.
+# Leaves — natural shape, no N×R materialization (params/literals stay scalar,
+# variables stay length-N vectors, draws are the only genuinely N×R leaves).
 _evaluate_draws(e::DCMParameter, data, params, draws) = params[e.name]
 _evaluate_draws(e::DCMLiteral,   data, params, draws) = e.value
 _evaluate_draws(e::DCMVariable,  data, params, draws) = data[:, e.name]
 _evaluate_draws(e::DCMDraw,      data, params, draws) = draws[e.name]
 
-# Operators. Each recursive call returns `Any` (the node fields are abstractly
-# typed), so we route the results through `_combine`/`_map` — function barriers
-# that re-specialize on the concrete runtime shapes/eltypes. That both keeps the
-# elementwise Dual kernel fast (critical in the ForwardDiff gradient path) and
-# lets each node materialize exactly one buffer.
-_combine(f, a, b) = f.(a, b)   # barrier: `a`, `b` are concrete inside here
-_map(f, a)        = f.(a)
+# Operators — lazy: return an unmaterialized `Broadcasted`. Nesting these builds
+# one fused broadcast tree for the whole utility, materialized once by the
+# wrapper above. Concrete node types make the fused kernel fully specialized
+# (incl. the ForwardDiff Dual path), so there is no per-node dispatch or buffer.
+_evaluate_draws(e::DCMSum,  data, params, draws) = Base.broadcasted(+, _evaluate_draws(e.left, data, params, draws), _evaluate_draws(e.right, data, params, draws))
+_evaluate_draws(e::DCMDiff, data, params, draws) = Base.broadcasted(-, _evaluate_draws(e.left, data, params, draws), _evaluate_draws(e.right, data, params, draws))
+_evaluate_draws(e::DCMMult, data, params, draws) = Base.broadcasted(*, _evaluate_draws(e.left, data, params, draws), _evaluate_draws(e.right, data, params, draws))
+_evaluate_draws(e::DCMDiv,  data, params, draws) = Base.broadcasted(/, _evaluate_draws(e.left, data, params, draws), _evaluate_draws(e.right, data, params, draws))
 
-_evaluate_draws(e::DCMSum,  data, params, draws) = _combine(+, _evaluate_draws(e.left, data, params, draws), _evaluate_draws(e.right, data, params, draws))
-_evaluate_draws(e::DCMDiff, data, params, draws) = _combine(-, _evaluate_draws(e.left, data, params, draws), _evaluate_draws(e.right, data, params, draws))
-_evaluate_draws(e::DCMMult, data, params, draws) = _combine(*, _evaluate_draws(e.left, data, params, draws), _evaluate_draws(e.right, data, params, draws))
-_evaluate_draws(e::DCMDiv,  data, params, draws) = _combine(/, _evaluate_draws(e.left, data, params, draws), _evaluate_draws(e.right, data, params, draws))
+_evaluate_draws(e::DCMExp,   data, params, draws) = Base.broadcasted(exp, _evaluate_draws(e.arg, data, params, draws))
+_evaluate_draws(e::DCMLog,   data, params, draws) = Base.broadcasted(log, _evaluate_draws(e.arg, data, params, draws))
+_evaluate_draws(e::DCMMinus, data, params, draws) = Base.broadcasted(-,   _evaluate_draws(e.arg, data, params, draws))
 
-_evaluate_draws(e::DCMExp,   data, params, draws) = _map(exp, _evaluate_draws(e.arg, data, params, draws))
-_evaluate_draws(e::DCMLog,   data, params, draws) = _map(log, _evaluate_draws(e.arg, data, params, draws))
-_evaluate_draws(e::DCMMinus, data, params, draws) = _map(-,   _evaluate_draws(e.arg, data, params, draws))
-
-function _evaluate_draws(e::DCMEqual, data, params, draws)
-    left_val = _evaluate_draws(e.left, data, params, draws)
-    return _combine((l, r) -> ifelse(l == r, one(l), zero(l)), left_val, e.right)
-end
+_evaluate_draws(e::DCMEqual, data, params, draws) =
+    Base.broadcasted((l, r) -> ifelse(l == r, one(l), zero(l)), _evaluate_draws(e.left, data, params, draws), e.right)
 
 export Parameter, Variable, Draw, evaluate
