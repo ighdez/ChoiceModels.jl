@@ -31,7 +31,7 @@ Generates simulation draws for each parameter name provided.
 function generate_draws(param_names::Vector{Symbol}, N::Int, R::Int; scheme::Symbol = :normal)
     values = Dict()
 
-    for pname in param_names
+    for (dim, pname) in enumerate(param_names)
         if scheme == :normal
             values[pname] = rand(Normal(), N, R)
 
@@ -39,7 +39,7 @@ function generate_draws(param_names::Vector{Symbol}, N::Int, R::Int; scheme::Sym
             values[pname] = rand(Uniform(-√3, √3), N, R)
 
         elseif scheme == :halton
-            values[pname] = halton_draws(N, R, pname)
+            values[pname] = halton_draws(N, R, dim)
 
         elseif scheme == :mlhs
             values[pname] = mlhs_draws(N, R, pname)
@@ -66,7 +66,7 @@ and transformed via the Normal quantile function.
 # Returns
 - `Matrix{Float64}`: a `N × R` matrix of transformed Halton draws
 """
-function halton_draws(N::Int, R::Int, pname::Symbol)
+function halton_draws(N::Int, R::Int, dim::Int)
     function halton(n, base)
         f, r = 1.0, 0.0
         while n > 0
@@ -77,9 +77,10 @@ function halton_draws(N::Int, R::Int, pname::Symbol)
         return r
     end
 
-    primes = Primes.primes(100)
-    index = hash(pname) % length(primes) + 1
-    base = primes[index]
+    # Assign the dim-th prime (2, 3, 5, 7, …) to the dim-th random dimension,
+    # matching Apollo's dimension-ordered small-prime bases. Large/hash-picked
+    # bases give terrible low-discrepancy coverage at small R and can collide.
+    base = Primes.prime(dim)
 
     draws = zeros(N, R)
     for i in 1:N

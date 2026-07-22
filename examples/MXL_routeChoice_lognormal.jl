@@ -5,14 +5,6 @@ using ChoiceModels
 df = CSV.read("../data/apollo_swissRouteChoiceData.csv", DataFrame)
 df = sort(df, :ID)
 
-# Scale
-df.tt1 ./= 60
-df.tt2 ./= 60
-df.hw1 ./= 60
-df.hw2 ./= 60
-df.tc1 ./= 10
-df.tc2 ./= 10
-
 # Define parameters for lognormal random coefficients
 mu_tt     = Parameter(:mu_tt, value=-3)
 sigma_tt  = Parameter(:sigma_tt, value=0.01,fixed=false)
@@ -53,7 +45,7 @@ availability = [
 # Build and estimate the Mixed Logit model
 using Random
 Random.seed!(12345)
-model = MixedLogitModel(utilities; data=df, idvar=:ID, availability=availability, R=100, draw_scheme=:halton)
+model = MixedLogitModel(utilities; data=df, idvar=:ID, availability=availability, R=500, draw_scheme=:halton)
 results = estimate(model, :choice)
 
 # @show results
