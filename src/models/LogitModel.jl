@@ -313,7 +313,12 @@ function estimate(
         pinv(H)
     end
 
-    std_errors = sqrt.(diag(vcov))
+    d = diag(vcov)
+    bad = free_names[findall(<(0), d)]
+    if !isempty(bad)
+        @warn "Non-positive-definite Hessian: negative variance for $(bad); reporting NaN standard error(s). These parameters are likely not identified."
+    end
+    std_errors = [dᵢ < 0 ? NaN : sqrt(dᵢ) for dᵢ in d]
 
     se = Dict{Symbol, Real}()
     for (i, name) in enumerate(free_names)
@@ -332,7 +337,12 @@ function estimate(
         pinv(H) * G * pinv(H)
     end
 
-    rob_std_errors = sqrt.(diag(V_rob))
+    d_rob = diag(V_rob)
+    bad_rob = free_names[findall(<(0), d_rob)]
+    if !isempty(bad_rob)
+        @warn "Non-positive-definite robust covariance: negative variance for $(bad_rob); reporting NaN robust standard error(s). These parameters are likely not identified."
+    end
+    rob_std_errors = [dᵢ < 0 ? NaN : sqrt(dᵢ) for dᵢ in d_rob]
 
     rob_se = Dict{Symbol, Real}()
     for (i, name) in enumerate(free_names)
