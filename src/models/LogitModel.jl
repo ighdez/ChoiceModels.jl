@@ -94,6 +94,12 @@ function logit_prob(
     return probs
 end
 
+# Cross-sectional `evaluate` for a nested LogitModel term. Defined here rather than
+# in Expressions.jl because `LogitModel`/`logit_prob` are only available after this
+# file is loaded; dispatch resolves it alongside the DCMExpression node methods.
+evaluate(e::LogitModel, data::DataFrame, params::AbstractDict) =
+    logit_prob(e.utilities, data, e.availability, params)
+
 """
 Computes predicted probabilities using estimated parameters.
 

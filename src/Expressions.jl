@@ -217,35 +217,25 @@ Evaluates a symbolic utility expression for all observations in a dataset.
 # Returns
 - `Vector{Float64}`: evaluated numeric result for each observation
 """
-function evaluate(expr::DCMExpression, data::DataFrame, params::AbstractDict)
-    if expr isa DCMParameter
-        return fill(params[expr.name], nrow(data))
-    elseif expr isa DCMVariable
-        return data[:, expr.name]
-    elseif expr isa LogitModel
-        return logit_prob(expr.utilities,data,expr.availability,params)
-    elseif expr isa DCMSum
-        return evaluate(expr.left, data, params) .+ evaluate(expr.right, data, params)
-    elseif expr isa DCMDiff
-        return evaluate(expr.left, data, params) .- evaluate(expr.right, data, params)
-    elseif expr isa DCMMult
-        return evaluate(expr.left, data, params) .* evaluate(expr.right, data, params)
-    elseif expr isa DCMDiv
-        return evaluate(expr.left, data, params) ./ evaluate(expr.right, data, params)
-    elseif expr isa DCMExp
-        return exp.(evaluate(expr.arg, data, params))
-    elseif expr isa DCMLog
-        return log.(evaluate(expr.arg, data, params))
-    elseif expr isa DCMEqual
-        left_val = evaluate(expr.left, data, params)
-        return ifelse.(left_val .== expr.right, one(eltype(left_val)), zero(eltype(left_val)))
-    elseif expr isa DCMMinus
-        return -evaluate(expr.arg, data, params)
-    elseif expr isa DCMLiteral
-        return fill(expr.value, nrow(data))
-    else
-        error("Unknown expression type")
-    end
+# One method per node type — dispatch replaces the former `if expr isa …` ladder,
+# so each method is type-stable and specializable (the `LogitModel` case lives in
+# models/LogitModel.jl, since that type is defined after this file is loaded).
+evaluate(e::DCMParameter, data::DataFrame, params::AbstractDict) = fill(params[e.name], nrow(data))
+evaluate(e::DCMVariable,  data::DataFrame, params::AbstractDict) = data[:, e.name]
+evaluate(e::DCMLiteral,   data::DataFrame, params::AbstractDict) = fill(e.value, nrow(data))
+
+evaluate(e::DCMSum,  data::DataFrame, params::AbstractDict) = evaluate(e.left, data, params) .+ evaluate(e.right, data, params)
+evaluate(e::DCMDiff, data::DataFrame, params::AbstractDict) = evaluate(e.left, data, params) .- evaluate(e.right, data, params)
+evaluate(e::DCMMult, data::DataFrame, params::AbstractDict) = evaluate(e.left, data, params) .* evaluate(e.right, data, params)
+evaluate(e::DCMDiv,  data::DataFrame, params::AbstractDict) = evaluate(e.left, data, params) ./ evaluate(e.right, data, params)
+
+evaluate(e::DCMExp,   data::DataFrame, params::AbstractDict) = exp.(evaluate(e.arg, data, params))
+evaluate(e::DCMLog,   data::DataFrame, params::AbstractDict) = log.(evaluate(e.arg, data, params))
+evaluate(e::DCMMinus, data::DataFrame, params::AbstractDict) = -evaluate(e.arg, data, params)
+
+function evaluate(e::DCMEqual, data::DataFrame, params::AbstractDict)
+    left_val = evaluate(e.left, data, params)
+    return ifelse.(left_val .== e.right, one(eltype(left_val)), zero(eltype(left_val)))
 end
 
 """
@@ -263,81 +253,54 @@ random draws, and data variables.
 # Returns
 - `Array{Float64, 2}`: evaluated result of shape `N × R`
 """
-function evaluate(expr::DCMExpression, data::DataFrame, params::AbstractDict, draws::AbstractDict)
-    result = begin
-        if expr isa DCMParameter
-            N, R = size(first(values(draws)))
-            fill(params[expr.name], N, R)
+# ---- N×R draws path --------------------------------------------------------
+# Public entry recurses with `_evaluate_draws`, whose leaves keep their natural
+# shape — parameters/literals stay scalar, variables stay length-N vectors,
+# draws are the only genuinely N×R leaves — instead of being materialized to
+# N×R up front with `fill`/`repeat`. Broadcasting reconciles the shapes, so a
+# utility allocates a handful of N×R buffers rather than one per leaf (the old
+# `fill(param, N, R)` cost was brutal in the ForwardDiff/Dual gradient path).
+# The wrapper then guarantees an N×R result — broadcasting a draw-free subtree
+# up if needed — so `logit_prob`'s `size(utils[j]) == (N, R)` contract holds.
+function evaluate(e::DCMExpression, data::DataFrame, params::AbstractDict, draws::AbstractDict)
+    N, R = size(first(values(draws)))
+    return _as_nxr(_evaluate_draws(e, data, params, draws), N, R)
+end
 
-        elseif expr isa DCMVariable
-            _, R = size(first(values(draws)))
-            repeat(data[:, expr.name], 1, R)
+# Broadcast a scalar/vector result up to N×R; pass an already-N×R matrix through.
+_as_nxr(v::AbstractMatrix, N::Int, R::Int) = v
+function _as_nxr(v, N::Int, R::Int)
+    out = Matrix{eltype(v)}(undef, N, R)
+    out .= v
+    return out
+end
 
-        elseif expr isa DCMDraw
-            draws[expr.name]
+# Leaves — natural shape, no N×R materialization.
+_evaluate_draws(e::DCMParameter, data, params, draws) = params[e.name]
+_evaluate_draws(e::DCMLiteral,   data, params, draws) = e.value
+_evaluate_draws(e::DCMVariable,  data, params, draws) = data[:, e.name]
+_evaluate_draws(e::DCMDraw,      data, params, draws) = draws[e.name]
 
-        elseif expr isa DCMSum
-            left = evaluate(expr.left, data, params, draws)
-            right = evaluate(expr.right, data, params, draws)
-            T = promote_type(eltype(left), eltype(right))
-            out = Array{T}(undef, size(left))
-            @. out = left + right
-            out
+# Operators. Each recursive call returns `Any` (the node fields are abstractly
+# typed), so we route the results through `_combine`/`_map` — function barriers
+# that re-specialize on the concrete runtime shapes/eltypes. That both keeps the
+# elementwise Dual kernel fast (critical in the ForwardDiff gradient path) and
+# lets each node materialize exactly one buffer.
+_combine(f, a, b) = f.(a, b)   # barrier: `a`, `b` are concrete inside here
+_map(f, a)        = f.(a)
 
-        elseif expr isa DCMMult
-            left = evaluate(expr.left, data, params, draws)
-            right = evaluate(expr.right, data, params, draws)
-            T = promote_type(eltype(left), eltype(right))
-            out = Array{T}(undef, size(left))
-            @. out = left * right
-            out
+_evaluate_draws(e::DCMSum,  data, params, draws) = _combine(+, _evaluate_draws(e.left, data, params, draws), _evaluate_draws(e.right, data, params, draws))
+_evaluate_draws(e::DCMDiff, data, params, draws) = _combine(-, _evaluate_draws(e.left, data, params, draws), _evaluate_draws(e.right, data, params, draws))
+_evaluate_draws(e::DCMMult, data, params, draws) = _combine(*, _evaluate_draws(e.left, data, params, draws), _evaluate_draws(e.right, data, params, draws))
+_evaluate_draws(e::DCMDiv,  data, params, draws) = _combine(/, _evaluate_draws(e.left, data, params, draws), _evaluate_draws(e.right, data, params, draws))
 
-        elseif expr isa DCMDiv
-            left = evaluate(expr.left, data, params, draws)
-            right = evaluate(expr.right, data, params, draws)
-            T = promote_type(eltype(left), eltype(right))
-            out = Array{T}(undef, size(left))
-            @. out = left / right
-            out
+_evaluate_draws(e::DCMExp,   data, params, draws) = _map(exp, _evaluate_draws(e.arg, data, params, draws))
+_evaluate_draws(e::DCMLog,   data, params, draws) = _map(log, _evaluate_draws(e.arg, data, params, draws))
+_evaluate_draws(e::DCMMinus, data, params, draws) = _map(-,   _evaluate_draws(e.arg, data, params, draws))
 
-        elseif expr isa DCMExp
-            arg = evaluate(expr.arg, data, params, draws)
-            T = eltype(arg)
-            out = Array{T}(undef, size(arg))
-            @. out = exp(arg)
-            out
-
-        elseif expr isa DCMLog
-            arg = evaluate(expr.arg, data, params, draws)
-            T = eltype(arg)
-            out = Array{T}(undef, size(arg))
-            @. out = log(arg)
-            out
-
-        elseif expr isa DCMEqual
-            left_val = evaluate(expr.left, data, params, draws)
-            T = eltype(left_val)
-            out = Array{T}(undef, size(left_val))
-            @. out = ifelse(left_val == expr.right, one(T), zero(T))
-            out
-
-        elseif expr isa DCMMinus
-            arg = evaluate(expr.arg, data, params, draws)
-            T = eltype(arg)
-            out = Array{T}(undef, size(arg))
-            @. out = -arg
-            out
-
-        elseif expr isa DCMLiteral
-            N, R = size(first(values(draws)))
-            fill(expr.value, N, R)
-
-        else
-            error("Unknown expression type")
-        end
-    end
-
-    return result
+function _evaluate_draws(e::DCMEqual, data, params, draws)
+    left_val = _evaluate_draws(e.left, data, params, draws)
+    return _combine((l, r) -> ifelse(l == r, one(l), zero(l)), left_val, e.right)
 end
 
 export Parameter, Variable, Draw, evaluate

@@ -1,0 +1,13 @@
+# ChoiceModels MXL baseline (seed 12345, R=100)
+evaluate_V1_sum   2.521439981285e+02
+evaluate_V1_size  3492 x 100
+f_obj_theta0      2.179131684668e+03
+gradient_theta0
+  mu_tt      8.247382197047e+01
+  sigma_tt   -3.241745505762e+01
+  mu_hw      1.823800454693e+02
+  sigma_hw   -1.248838906026e+02
+  sigma_tc   1.124348245516e+01
+  sigma_ch   -3.585834092139e+02
+  mu_tc      -5.732777078402e+01
+  mu_ch      4.765747777836e+02
