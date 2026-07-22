@@ -51,8 +51,10 @@ availability = [
 ]
 
 # Build and estimate the Mixed Logit model
-model = MixedLogitModel(utilities; data=df, id=df.ID, availability=availability, R=100, draw_scheme=:mlhs)
-results = estimate(model, df.choice)
+using Random
+Random.seed!(12345)
+model = MixedLogitModel(utilities; data=df, idvar=:ID, availability=availability, R=100, draw_scheme=:mlhs)
+results = estimate(model, :choice)
 
 # @show results
 

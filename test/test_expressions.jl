@@ -25,20 +25,18 @@ using DataFrames
         @test result ≈ [0.5 - 2.0, 0.5 - 3.0, 0.5 - 4.0]
     end
 
-    @testset "Logit probabilities" begin
-        asc = Parameter(:asc, value=0.0)
-        β_time = Parameter(:β_time, value=-0.1)
-        V1 = asc + β_time * Variable(:time1)
-        V2 = asc + β_time * Variable(:time2)
+    @testset "exp, log and division" begin
+        a = Parameter(:a, value=0.0)
+        b = Parameter(:b, value=0.0)
+        df = DataFrame(x = [2.0, 4.0])
+        params = Dict(:a => 0.5, :b => 2.0)
 
-        df = DataFrame(time1 = [10.0, 20.0], time2 = [15.0, 5.0])
-        params = Dict(:asc => 0.0, :β_time => -0.1)
-        availability = [trues(2), trues(2)]
-
-        probs = logit_prob([V1, V2], df, params, availability)
-        @test length(probs) == 2
-        @test all(length.(probs) .== 2)
-        @test all(x -> all(0 .<= x .<= 1), probs)
+        # exp(a * x) with a = 0.5  →  exp(1.0), exp(2.0)
+        @test evaluate(exp(a * Variable(:x)), df, params) ≈ exp.([1.0, 2.0])
+        # log(x)  →  log(2), log(4)
+        @test evaluate(log(Variable(:x)), df, params) ≈ log.([2.0, 4.0])
+        # a / b  →  0.25 (broadcast over rows)
+        @test evaluate(a / b, df, params) ≈ [0.25, 0.25]
     end
 
 end
