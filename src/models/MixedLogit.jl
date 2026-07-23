@@ -135,10 +135,19 @@ function logit_prob(
 
     Threads.@threads for r in 1:R
         @inbounds begin
+            # Per-row max utility across *available* alternatives, for numerically
+            # stable softmax. Without this, extreme utilities (e.g. lognormal
+            # coefficients on large draws) make every exp(u) underflow to 0, the
+            # normalisation collapses to 0/0, and the simulated likelihood is biased
+            # sharply downward. Subtracting the max is mathematically identical (it
+            # cancels in the ratio) but keeps the largest term at exp(0)=1.
+            m = fill(T(-Inf), N)
             for j in 1:J
-                # u = clamp.(utils[j][:,r], T(-200), T(200))
-                u = utils[j][:,r]
-                expU[:, j, r] .= ifelse.(availability[j], exp.(u), 0.0)
+                m .= ifelse.(availability[j], max.(m, utils[j][:, r]), m)
+            end
+            for j in 1:J
+                u = utils[j][:, r]
+                expU[:, j, r] .= ifelse.(availability[j], exp.(u .- m), 0.0)
             end
             s_expU[:, r] .= sum(expU[:, :, r]; dims = 2)
         end

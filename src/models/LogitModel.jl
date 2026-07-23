@@ -86,8 +86,12 @@ function logit_prob(
         @views U[:, j] .= ifelse.(availability[j], U[:, j], -Inf)
     end
     
-    # Calculate choice probabilities
-    expU = exp.(U)
+    # Calculate choice probabilities (stable softmax: subtract the per-row max
+    # utility so the largest term is exp(0)=1 and extreme utilities can't under/
+    # overflow; the shift cancels in the ratio). Unavailable alts are -Inf, so
+    # they stay exp(-Inf)=0.
+    m = maximum(U, dims=2)
+    expU = exp.(U .- m)
     s_expU = sum(expU, dims=2)
     probs = expU ./ s_expU
 
