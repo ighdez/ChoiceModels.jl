@@ -110,8 +110,11 @@ function mlhs_draws(N::Int, R::Int, pname::Symbol)
     draws = zeros(N, R)
     for i in 1:N
         u = ((0:R-1) .+ rand(R)) ./ R
-        draws[i, :] .= quantile.(Normal(), u)
-        shuffle!(draws[i, :])
+        # Shuffle the fresh vector, THEN assign. `shuffle!(draws[i, :])` would
+        # permute a throwaway copy (row indexing materialises a new array), leaving
+        # the row in sorted order — which makes every dimension identically ordered
+        # and thus perfectly rank-correlated, corrupting the joint draw.
+        draws[i, :] .= shuffle!(quantile.(Normal(), u))
     end
     return draws
 end
