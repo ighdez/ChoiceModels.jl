@@ -18,14 +18,22 @@ df.SM_CO    .= ifelse.(df.GA .== 0, df.SM_CO, 0.0)
 df.TRAIN_CO .= ifelse.(df.GA .== 0, df.TRAIN_CO, 0.0)
 
 # Define variables and parameters per class
+#
+# The two classes MUST start at different values. If every class-specific
+# parameter starts at 0 the classes are identical at θ₀, and with π_1 = π_2 the
+# gradients w.r.t. β_time_1 and β_time_2 are then *bitwise* identical while the
+# gradient w.r.t. delta_1 is exactly 0 — so BFGS moves both classes by the same
+# amount at every step and {class 1 = class 2} is an invariant subspace the
+# optimizer can only leave on floating-point noise. Seeding the slopes apart
+# (as LC2_routeChoice.jl does) breaks the symmetry by construction.
 
 # Class 1
 asc_car_1 = Parameter(:asc_car_1, value=0)
 asc_train_1 = Parameter(:asc_train_1, value=0)
 asc_sm_1 = Parameter(:asc_sm_1, value=0, fixed=true)
 
-β_time_1 = Parameter(:β_time_1, value=0)
-β_cost_1 = Parameter(:β_cost_1, value=0)
+β_time_1 = Parameter(:β_time_1, value=-0.1)
+β_cost_1 = Parameter(:β_cost_1, value=-0.5)
 
 
 # Define utility functions
@@ -40,8 +48,8 @@ asc_car_2 = Parameter(:asc_car_2, value=0)
 asc_train_2 = Parameter(:asc_train_2, value=0)
 asc_sm_2 = Parameter(:asc_sm_2, value=0, fixed=true)
 
-β_time_2 = Parameter(:β_time_2, value=0)
-β_cost_2 = Parameter(:β_cost_2, value=0)
+β_time_2 = Parameter(:β_time_2, value=-0.05)
+β_cost_2 = Parameter(:β_cost_2, value=-0.25)
 
 
 # Define utility functions
