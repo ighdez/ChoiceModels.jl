@@ -20,7 +20,13 @@ end
 
     # ---- shared fixture: 2 classes, 3 alternatives, 5 individuals × 4 obs -----
     Random.seed!(7)
-    I_ind, T_obs, J = 5, 4, 3
+    # 40 individuals, not 5. The panel likelihood returns one contribution per
+    # INDIVIDUAL, so the score matrix `G` is built from is I × K — with I = 5 and
+    # K = 5 free parameters it was square and rank-deficient, and
+    # `bhhh_matrix_status` (correctly) flagged the whole suite on every run. The
+    # hand-rolled references below are all computed from `params` and `df`, so
+    # they follow the fixture size automatically.
+    I_ind, T_obs, J = 40, 4, 3
     ids = repeat(1:I_ind, inner=T_obs)
     N = length(ids)
 

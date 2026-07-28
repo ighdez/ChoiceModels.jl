@@ -232,6 +232,73 @@ function hessian_status(H::AbstractMatrix, free_names::AbstractVector{Symbol}; r
 end
 
 """
+Classifies the BHHH matrix `G = Σᵢ sᵢsᵢ'` as `:posdef` or `:singular`, warning
+(and naming the parameters responsible) when it is rank-deficient.
+
+This is the `G`-side counterpart of `hessian_status`, and it exists for exactly
+the same reason: **a degenerate `G` cannot announce itself through the standard
+error values.** `G` is positive semi-definite by construction, so `_safe_inv`
+pseudo-inverts it to something with a perfectly non-negative diagonal, and
+`guarded_std_errors` — which only rejects *negative* variances — stays silent.
+The result is a standard error of exactly `0.0` for the unidentified direction,
+i.e. `t = Inf` and `p = 0.0000`, reported as if it were the most precisely
+estimated parameter in the model.
+
+`G` singular is not a cosmetic problem, and it is **not** implied by a healthy
+Hessian: measured on a fixture with a positive-definite `H` and `rank(G) = 1` of
+2, `hessian_status` returned `:posdef` while the robust column reported
+`0.0` — the sandwich `inv(H) G inv(H)` is built from `G`, so it degenerates even
+though the arithmetic never fails. That is why this check is separate and why a
+singular `G` suppresses *all three* estimators rather than just BHHH: robust is
+built from `G` directly, and classical would be the lone survivor of a covariance
+matrix we have just established cannot be computed.
+
+Only the zero-eigenvalue case is classified. A genuinely negative eigenvalue is
+impossible for an outer product of scores; anything below zero here is roundoff
+and is treated as flat.
+
+# Arguments
+- `G::AbstractMatrix`: outer product of the per-observation score vectors
+- `free_names::Vector{Symbol}`: free parameter names, in the same order as `G`
+
+# Returns
+- `Symbol`: `:posdef` or `:singular`
+"""
+function bhhh_matrix_status(G::AbstractMatrix, free_names::AbstractVector{Symbol}; rtol::Real = 1e-10)
+    k = size(G, 1)
+    k == 0 && return :posdef
+
+    M = Matrix(G)
+    F = eigen(Symmetric((M .+ M') ./ 2))
+    λ = F.values
+    λmax = maximum(abs, λ)
+
+    # Same empirical tolerance as `hessian_status` — see the note there on why the
+    # textbook `k*eps*λmax` bound is too tight for an AD-accumulated matrix.
+    tol = rtol * max(λmax, one(λmax))
+    flat = findall(x -> x <= tol, λ)
+
+    isempty(flat) && return :posdef
+
+    culprits = unique(reduce(vcat, [
+        free_names[abs.(F.vectors[:, i]) .> 0.1 * maximum(abs, F.vectors[:, i])]
+        for i in flat
+    ]; init = Symbol[]))
+
+    @warn """
+          The BHHH matrix (the outer product of the scores) is singular at the reported \
+          optimum: $(length(flat)) of $(k) eigenvalue(s) are zero to working precision.
+          Parameters involved: $(culprits).
+          That combination of parameters contributes no score variation in the sample, so it \
+          is not identified. NO covariance matrix has been computed — classical, robust and \
+          BHHH standard errors are all suppressed, because every one of them is built from \
+          this matrix or would be the sole survivor of one that cannot be formed. Fix or drop \
+          the parameter(s) above and re-estimate.
+          """
+    return :singular
+end
+
+"""
 Computes all three maximum-likelihood covariance estimators at the optimum, plus
 the `hessian_status` verdict.
 
@@ -251,8 +318,24 @@ name two specific, comparable estimators — a column whose meaning silently
 changes between runs breaks exactly the comparison it exists to support. Note
 also that when `H` is bad the *robust* column is equally bad, since it is built
 from the same `inv(H)`; a fallback in one column would have implied the other was
-fine. `hessian_status` is what tells you whether to trust them, and BHHH is
-offered as its own clearly-labelled third set.
+fine. `hessian_status` is what tells you whether to trust them.
+
+**BHHH is computed and returned, but never presented.** `summarize_results` shows
+only the classical and robust columns, following Apollo. BHHH's justification is
+the information matrix equality `H = G`, which holds only at the true parameter
+under correct specification — precisely the assumption in doubt whenever `H` is
+not positive definite, which is the one situation an earlier version of this code
+chose to display it in. Being PSD by construction makes BHHH *look* well-formed;
+it does not make it a consistent estimator of a covariance whose defining
+assumption has just failed. It stays in the returned `NamedTuple` for anyone who
+explicitly wants it, and out of the report.
+
+**A singular `G` suppresses everything.** When `bhhh_matrix_status` returns
+`:singular` no covariance matrix is computed at all — every matrix and standard
+error field comes back `nothing` (following Apollo: "if the BHHH matrix is
+singular, no attempt will be made to calculate the full covariance matrix"). See
+`bhhh_matrix_status` for why a degenerate `G` cannot be detected from the
+standard error values themselves.
 
 # Arguments
 - `H::AbstractMatrix`: Hessian of the **negative** log-likelihood at the optimum
@@ -260,12 +343,32 @@ offered as its own clearly-labelled third set.
 - `free_names::Vector{Symbol}`: free parameter names, in the same order as `H`
 
 # Returns
-- `NamedTuple` with `status`, and `vcov`/`std_errors`, `rob_vcov`/`rob_std_errors`,
-  `bhhh_vcov`/`bhhh_std_errors` (the `*_std_errors` entries are `Dict`s keyed by
-  parameter name)
+- `NamedTuple` with `status` (the `hessian_status` verdict), `bhhh_matrix` (the
+  `bhhh_matrix_status` verdict), and `vcov`/`std_errors`, `rob_vcov`/`rob_std_errors`,
+  `bhhh_vcov`/`bhhh_std_errors`. The `*_std_errors` entries are `Dict`s keyed by
+  parameter name, or `nothing` (as are the matrices) when `G` is singular.
 """
 function covariance_estimates(H::AbstractMatrix, G::AbstractMatrix, free_names::AbstractVector{Symbol})
     status = hessian_status(H, free_names)
+    bhhh_matrix = bhhh_matrix_status(G, free_names)
+
+    # Apollo's rule: a singular BHHH matrix means no covariance matrix is
+    # attempted at all. Not a partial result — the robust estimator is built from
+    # `G` directly and would report 0.0 for the unidentified direction, and
+    # reporting the classical column alone would present the one estimator that
+    # happens to survive as if the covariance matrix were fine.
+    if bhhh_matrix === :singular
+        return (
+            status          = status,
+            bhhh_matrix     = bhhh_matrix,
+            vcov            = nothing,
+            std_errors      = nothing,
+            rob_vcov        = nothing,
+            rob_std_errors  = nothing,
+            bhhh_vcov       = nothing,
+            bhhh_std_errors = nothing,
+        )
+    end
 
     H_inv = _safe_inv(H)
 
@@ -281,6 +384,7 @@ function covariance_estimates(H::AbstractMatrix, G::AbstractMatrix, free_names::
 
     return (
         status          = status,
+        bhhh_matrix     = bhhh_matrix,
         vcov            = vcov,
         std_errors      = as_dict(guarded_std_errors(vcov,      free_names, "Hessian-based covariance")),
         rob_vcov        = rob_vcov,
@@ -338,14 +442,28 @@ function summarize_results(results::NamedTuple; file::Union{String, Nothing}=not
 
     hessian = get(results, :hessian, nothing)
 
-    # BHHH/OPG is included only when the Hessian failed — and as its OWN columns,
-    # never in place of the classical ones. When `H` is indefinite both the
-    # classical and the robust figures are built from `inv(H)` and are unusable,
-    # while `G = Σᵢ sᵢsᵢ'` stays PSD by construction, so this is the one of the
-    # three still worth reading. Deliberately EXCLUDED for a `:singular` Hessian:
-    # `G` is rank-deficient in the same direction there, so BHHH is degenerate too
-    # and showing it would suggest a way out that does not exist.
-    show_bhhh = hessian === :indefinite && haskey(results, :bhhh_std_errors)
+    # A singular Hessian means a parameter (or combination) is not identified, so
+    # the classical standard errors do not exist — `_safe_inv` only manufactures
+    # plausible-looking numbers for them out of a pseudo-inverse. Following
+    # Apollo, that is an estimation error and results are not summarized at all.
+    # `estimate` still returns normally, so the caller keeps the converged
+    # estimates and the verdict for debugging; what is refused is presenting them
+    # as a result table with standard errors attached.
+    if hessian === :singular
+        error("""
+              Refusing to summarize: the Hessian is singular at the reported optimum, so no \
+              classical covariance matrix exists and the standard errors cannot be computed. \
+              See the warning issued during estimation for the parameter(s) whose combination \
+              is not identified by the data — fix one of them (or drop it) and re-estimate.
+              The returned results object still holds the estimates and `hessian == :singular` \
+              if you need to inspect the fit that produced this.
+              """)
+    end
+
+    # `covariance_estimates` returns `nothing` for every covariance field when the
+    # BHHH matrix is singular — no covariance matrix was attempted. The estimates
+    # are still worth showing; the standard error columns simply do not exist.
+    has_cov = !isnothing(se_dict)
 
     println("Estimation Results\n==================\n")
 
@@ -358,24 +476,21 @@ function summarize_results(results::NamedTuple; file::Union{String, Nothing}=not
     pname = String[]; est = Float64[]
     sc = Float64[]; tc = Float64[]; pc = Float64[]
     sr = Float64[]; tr = Float64[]; pr = Float64[]
-    sb = Float64[]; tb = Float64[]; pb = Float64[]
 
     for (name, value) in rows
         push!(pname, string(name)); push!(est, value)
+        has_cov || continue
 
         s = get(se_dict, name, NaN);   push!(sc, s); push!(tc, value / s); push!(pc, _p(value / s))
         s = get(se_robust, name, NaN); push!(sr, s); push!(tr, value / s); push!(pr, _p(value / s))
-        if show_bhhh
-            s = get(results.bhhh_std_errors, name, NaN)
-            push!(sb, s); push!(tb, value / s); push!(pb, _p(value / s))
-        end
     end
 
-    df = DataFrame(Parameter=pname, Estimate=est, StdError=sc, tStat=tc, PValue=pc)
-    if show_bhhh
-        df.BHHH_SE = sb; df.BHHH_tStat = tb; df.BHHH_PValue = pb
+    df = has_cov ?
+        DataFrame(Parameter=pname, Estimate=est, StdError=sc, tStat=tc, PValue=pc) :
+        DataFrame(Parameter=pname, Estimate=est)
+    if has_cov
+        df.RobustSE = sr; df.Robust_tStat = tr; df.Robust_PValue = pr
     end
-    df.RobustSE = sr; df.Robust_tStat = tr; df.Robust_PValue = pr
 
     function print_block(title, se_col, t_col, p_col, se_header)
         println(title)
@@ -387,21 +502,32 @@ function summarize_results(results::NamedTuple; file::Union{String, Nothing}=not
         end
     end
 
-    # This heading always means inv(H) — no estimator is ever substituted
-    # underneath it (see `covariance_estimates`).
-    print_block("Classic Standard Errors", :StdError, :tStat, :PValue, "Std. Error")
-
-    if show_bhhh
-        println("\n(The Hessian is not positive definite, so the classical and robust figures —")
-        println(" both built from inv(H) — are unreliable. These BHHH/OPG ones are not.)")
-        print_block("BHHH/OPG Standard Errors", :BHHH_SE, :BHHH_tStat, :BHHH_PValue, "BHHH SE")
+    if has_cov
+        # These two headings always mean inv(H) and inv(H) G inv(H) respectively —
+        # no estimator is ever substituted underneath either (see
+        # `covariance_estimates`). BHHH is computed and returned but deliberately
+        # never presented here.
+        print_block("Classic Standard Errors", :StdError, :tStat, :PValue, "Std. Error")
+        println()
+        print_block("Robust Standard Errors (Sandwich)", :RobustSE, :Robust_tStat, :Robust_PValue, "Robust SE")
+    else
+        println("Parameter Estimates (no standard errors available)")
+        println(@sprintf("%-20s %10s", "Parameter", "Estimate"))
+        println(repeat("-", 32))
+        for row in eachrow(df)
+            println(@sprintf("%-20s %10.4f", row.Parameter, row.Estimate))
+        end
+        println("\n(The BHHH matrix is singular, so no covariance matrix was computed and no")
+        println(" standard errors — classical, robust or BHHH — are available. See the warning")
+        println(" issued during estimation for the parameter(s) involved.)")
     end
 
-    println()
-    print_block("Robust Standard Errors (Sandwich)", :RobustSE, :Robust_tStat, :Robust_PValue, "Robust SE")
-
     # ---- one summary table, likewise shared -----------------------------------
-    free_params = length(se_dict)
+    # `free_parameters` is carried by the results object; fall back to counting the
+    # standard error dict for results produced before that field existed (it is
+    # keyed by the free names). The fallback is unavailable when no covariance was
+    # computed, which is exactly why the field was added.
+    free_params = get(results, :free_parameters, has_cov ? length(se_dict) : 0)
     N = results.N
     ll0 = results.null_loglikelihood
 
@@ -425,6 +551,12 @@ function summarize_results(results::NamedTuple; file::Union{String, Nothing}=not
         push!(summary, ("Hessian at optimum", _hessian_label(hessian),
                         @sprintf("%10s", _hessian_label(hessian))))
     end
+    # Same rationale as the Hessian row: the reason there are no standard errors
+    # belongs next to `Converged`, not only in a warning that scrolled past.
+    if !has_cov
+        push!(summary, ("BHHH matrix", "SINGULAR", @sprintf("%10s", "SINGULAR")))
+        push!(summary, ("Covariance matrix", "not computed", @sprintf("%10s", "not comp.")))
+    end
     append!(summary, Tuple{String,Any,String}[
         ("Estimation time (seconds)", estimation_time, @sprintf("%10.2f", estimation_time)),
         ("Number of free parameters", free_params,     @sprintf("%10d",   free_params)),
@@ -439,7 +571,7 @@ function summarize_results(results::NamedTuple; file::Union{String, Nothing}=not
         println(@sprintf("%-27s: %s", label, text))
     end
 
-    if !isnothing(hessian) && hessian !== :posdef
+    if has_cov && !isnothing(hessian) && hessian !== :posdef
         println("\nNOTE: the Hessian is not positive definite, so the standard errors above are")
         println("      unreliable. See the warning issued during estimation for the parameters")
         println("      involved.")

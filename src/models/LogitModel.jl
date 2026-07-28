@@ -198,12 +198,21 @@ Uses `Optim.jl` to minimize the negative log-likelihood. Computes standard error
     - `parameters`: estimated values
     - `std_errors`: classical standard errors
     - `rob_std_errors`: robust standard errors (White)
+    - `bhhh_std_errors`: BHHH/OPG standard errors — returned for completeness but
+      deliberately never reported by `summarize_results` (see `covariance_estimates`)
     - `vcov`: classical variance-covariance matrix
     - `rob_vcov`: robust variance-covariance matrix
+    - `bhhh_vcov`: BHHH/OPG variance-covariance matrix
+    - `hessian`: `hessian_status` verdict for `H` (`:posdef`/`:indefinite`/`:singular`)
+    - `bhhh_matrix`: `bhhh_matrix_status` verdict for `G` (`:posdef`/`:singular`)
+    - `free_parameters`: number of free parameters
     - `loglikelihood`: log-likelihood at optimum
     - `iters`: number of iterations
     - `converged`: convergence status
     - `estimation_time`: time taken (in seconds)
+
+Every covariance and standard error field above is `nothing` when `bhhh_matrix`
+is `:singular` — no covariance matrix is computed at all in that case.
 """
 function estimate(
     model::LogitModel,
@@ -331,6 +340,8 @@ function estimate(
         bhhh_std_errors = cov.bhhh_std_errors,
         bhhh_vcov = cov.bhhh_vcov,
         hessian = cov.status,
+        bhhh_matrix = cov.bhhh_matrix,
+        free_parameters = length(free_names),
         null_loglikelihood = ll0,
         loglikelihood = -Optim.minimum(result),
         iters = Optim.iterations(result),
@@ -361,6 +372,18 @@ function evaluate(
     model::LogitModel,
     results::NamedTuple
 )
+    # The delta method needs a covariance matrix; there is none when the BHHH
+    # matrix was singular (see `covariance_estimates`), so fail with the reason
+    # rather than on `g' * nothing * g`.
+    if isnothing(results.vcov) || isnothing(results.rob_vcov)
+        error("""
+              Cannot evaluate derived expressions: no covariance matrix was computed for this \
+              model (the BHHH matrix was singular at the optimum), and the standard error of a \
+              derived quantity is obtained from it by the delta method. See the warning issued \
+              during estimation for the unidentified parameter(s).
+              """)
+    end
+
     # 1. Extraer nombres de parámetros libres y su orden
     all_params = collect_parameters(model.utilities)
     free_params = filter(p -> !p.fixed, all_params)

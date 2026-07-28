@@ -19,17 +19,20 @@ end
 
 # Minimal results NamedTuple accepted by `summarize_results`, for exercising the
 # reporting logic without running an estimation that happens to be ill-behaved.
-function fake_results(; hessian, se = 0.5, bhhh_se = 0.25)
+function fake_results(; hessian, se = 0.5, bhhh_se = 0.25, has_cov = true,
+                       bhhh_matrix = has_cov ? :posdef : :singular)
     names = [:a, :b]
     return (
         parameters      = Dict{Symbol,Real}(n => 1.0 for n in names),
-        std_errors      = Dict{Symbol,Real}(n => se for n in names),
-        rob_std_errors  = Dict{Symbol,Real}(n => se for n in names),
-        bhhh_std_errors = Dict{Symbol,Real}(n => bhhh_se for n in names),
+        std_errors      = has_cov ? Dict{Symbol,Real}(n => se for n in names) : nothing,
+        rob_std_errors  = has_cov ? Dict{Symbol,Real}(n => se for n in names) : nothing,
+        bhhh_std_errors = has_cov ? Dict{Symbol,Real}(n => bhhh_se for n in names) : nothing,
         loglikelihood      = -100.0,
         null_loglikelihood = -200.0,
         iters = 5, converged = true, estimation_time = 1.0, N = 500,
         hessian = hessian,
+        bhhh_matrix = bhhh_matrix,
+        free_parameters = 2,
     )
 end
 
@@ -69,10 +72,59 @@ end
         @test cov.vcov ≈ inv(H)
         @test cov.std_errors[:a] ≈ 1.0
         @test isnan(cov.std_errors[:b])
-        # BHHH is available alongside it, finite, and is NOT the classical column.
+        # BHHH is computed and returned alongside it — but never presented; see
+        # the reporting testset below.
         @test cov.bhhh_vcov ≈ inv(G)
         @test all(isfinite, values(cov.bhhh_std_errors))
         @test cov.bhhh_std_errors[:b] ≈ 0.25
+    end
+
+    # Apollo: "If the BHHH matrix is singular, no attempt will be made to
+    # calculate the full covariance matrix." The case that makes this necessary is
+    # a HEALTHY Hessian with a degenerate G — `hessian_status` reports :posdef, so
+    # nothing else in the pipeline notices, and because G is PSD by construction
+    # its pseudo-inverse has a non-negative diagonal: `guarded_std_errors` stays
+    # silent and the ROBUST column (which is built from G) reports exactly 0.0,
+    # i.e. t = Inf, p = 0.0000, for the unidentified direction.
+    @testset "a singular BHHH matrix suppresses the whole covariance matrix" begin
+        H = [2.0 0.0; 0.0 3.0]                    # perfectly fine, positive definite
+        s = [1.0 0.0; 2.0 0.0; -1.5 0.0]          # scores carry nothing about `b`
+        G = s' * s
+        @test rank(G) == 1                        # singular BHHH matrix
+
+        # Without the guard this is the number that would be printed.
+        H_inv = inv(H)
+        @test (H_inv * G * H_inv)[2, 2] == 0.0    # robust variance of `b`: exactly 0
+
+        cov = @test_logs (:warn,) match_mode=:any ChoiceModels.covariance_estimates(H, G, names2)
+
+        @test cov.status === :posdef              # H alone would have said "all fine"
+        @test cov.bhhh_matrix === :singular
+        # Nothing partial: every estimator is withheld, not just BHHH.
+        @test cov.vcov === nothing
+        @test cov.rob_vcov === nothing
+        @test cov.bhhh_vcov === nothing
+        @test cov.std_errors === nothing
+        @test cov.rob_std_errors === nothing
+        @test cov.bhhh_std_errors === nothing
+
+        # A full-rank G leaves everything alone and says nothing.
+        ok = ChoiceModels.covariance_estimates(H, [9.0 0.0; 0.0 16.0], names2)
+        @test ok.bhhh_matrix === :posdef
+        @test ok.vcov !== nothing
+    end
+
+    @testset "bhhh_matrix_status classifies and warns" begin
+        @test ChoiceModels.bhhh_matrix_status([9.0 0.0; 0.0 16.0], names2) === :posdef
+        @test_logs ChoiceModels.bhhh_matrix_status([9.0 0.0; 0.0 16.0], names2)
+
+        G_sing = [4.0 2.0; 2.0 1.0]               # rank 1
+        @test rank(G_sing) == 1
+        # The trap this exists to catch: pinv gives it a clean non-negative
+        # diagonal, so no downstream SE check can flag it.
+        @test all(diag(pinv(G_sing)) .>= 0)
+        st = @test_logs (:warn,) match_mode=:any ChoiceModels.bhhh_matrix_status(G_sing, names2)
+        @test st === :singular
     end
 
     @testset "guarded_std_errors reports NaN instead of throwing" begin
@@ -105,28 +157,62 @@ end
         @test sing === :singular
     end
 
-    @testset "summarize_results shows the Hessian verdict and gates the BHHH block" begin
-        # Headings must never lie: "Classic" is present in every case.
-        for status in (:posdef, :indefinite, :singular)
-            @test occursin("Classic Standard Errors",
-                           capture_stdout(() -> summarize_results(fake_results(hessian=status))))
+    @testset "summarize_results presents only classical and robust" begin
+        # Following Apollo: BHHH is computed and returned, but never presented.
+        # Its justification is the information matrix equality H = G, which holds
+        # only under correct specification at the true parameter — precisely what
+        # is in doubt whenever H is not PD, which is the one case an earlier
+        # version of this code chose to display it in.
+        for status in (:posdef, :indefinite)
+            out = capture_stdout(() -> summarize_results(fake_results(hessian=status)))
+            @test occursin("Classic Standard Errors", out)
+            @test occursin("Robust Standard Errors", out)
+            @test !occursin("BHHH", out)
         end
 
         pd = capture_stdout(() -> summarize_results(fake_results(hessian=:posdef)))
         @test occursin("Hessian at optimum", pd)
         @test occursin("pos. def.", pd)
-        @test !occursin("BHHH", pd)                 # no extra block when nothing is wrong
 
-        # Indefinite: BHHH is the one estimator still worth reading, so show it.
         indef = capture_stdout(() -> summarize_results(fake_results(hessian=:indefinite)))
         @test occursin("INDEFINITE", indef)
-        @test occursin("BHHH/OPG Standard Errors", indef)
+        # Indefinite still summarizes — the SEs exist, they are just not trustworthy.
+        @test occursin("NOTE: the Hessian is not positive definite", indef)
+    end
 
-        # Singular: G is rank-deficient in the same direction, so BHHH is degenerate
-        # too — showing it would imply a way out that does not exist.
-        sing = capture_stdout(() -> summarize_results(fake_results(hessian=:singular)))
-        @test occursin("SINGULAR", sing)
-        @test !occursin("BHHH/OPG Standard Errors", sing)
+    @testset "a singular Hessian refuses to summarize at all" begin
+        # Apollo treats a singular Hessian as an estimation error and does not
+        # allow results to be summarized. `estimate` still returns normally, so
+        # the caller keeps the estimates and the verdict — what is refused is
+        # rendering them as a table with standard errors attached, which is what
+        # `_safe_inv`'s pseudo-inverse would otherwise manufacture.
+        @test_throws ErrorException summarize_results(fake_results(hessian=:singular))
+
+        err = try
+            summarize_results(fake_results(hessian=:singular)); ""
+        catch e
+            sprint(showerror, e)
+        end
+        @test occursin("singular", err)
+        @test occursin("not identified", err)
+    end
+
+    @testset "no covariance matrix: estimates shown, standard errors withheld" begin
+        out = capture_stdout(() -> summarize_results(fake_results(hessian=:posdef, has_cov=false)))
+
+        # The estimates are still worth reporting...
+        @test occursin("Parameter Estimates (no standard errors available)", out)
+        @test occursin("Log-likelihood at optimum", out)
+        # ...but no standard error column of any kind appears.
+        @test !occursin("Classic Standard Errors", out)
+        @test !occursin("Robust Standard Errors", out)
+        @test !occursin("BHHH", out) || occursin("BHHH matrix", out)
+        @test occursin("BHHH matrix", out)          # the reason, in the summary block
+        @test occursin("not comp.", out)
+        # AIC/BIC still need the free parameter count, which no longer comes from
+        # the (absent) standard error dict.
+        @test occursin("Number of free parameters", out)
+        @test occursin("AIC", out)
     end
 
     @testset "console and Excel export stay in step" begin
@@ -159,27 +245,49 @@ end
             end
         end
 
-        # When BHHH is shown it must reach the spreadsheet too, not just the console.
-        mktempdir() do dir
-            path = joinpath(dir, "out.xlsx")
-            printed = capture_stdout(() -> summarize_results(fake_results(hessian=:indefinite); file=path))
-            @test occursin("BHHH/OPG Standard Errors", printed)
-            XLSX.openxlsx(path) do xf
-                header = [xf["Estimates"][1, j] for j in 1:11]
-                @test "BHHH_SE" in header
-                @test "RobustSE" in header
-                @test "StdError" in header
+        # BHHH reaches neither the console nor the spreadsheet, in any Hessian state.
+        for status in (:posdef, :indefinite)
+            mktempdir() do dir
+                path = joinpath(dir, "out.xlsx")
+                printed = capture_stdout(() -> summarize_results(fake_results(hessian=status); file=path))
+                @test !occursin("BHHH", printed)
+                XLSX.openxlsx(path) do xf
+                    header = [xf["Estimates"][1, j] for j in 1:8]
+                    @test !("BHHH_SE" in header)
+                    @test "RobustSE" in header
+                    @test "StdError" in header
+                end
             end
         end
 
-        # ...and must be absent from both when it is not applicable.
+        # With no covariance matrix the export carries the estimates alone — and
+        # the summary sheet still explains why, in step with the console.
         mktempdir() do dir
             path = joinpath(dir, "out.xlsx")
-            printed = capture_stdout(() -> summarize_results(fake_results(hessian=:posdef); file=path))
-            @test !occursin("BHHH", printed)
+            printed = capture_stdout(() -> summarize_results(
+                fake_results(hessian=:posdef, has_cov=false); file=path))
             XLSX.openxlsx(path) do xf
-                header = [xf["Estimates"][1, j] for j in 1:8]
-                @test !("BHHH_SE" in header)
+                header = String[]
+                j = 1
+                while !ismissing(xf["Estimates"][1, j])
+                    push!(header, xf["Estimates"][1, j]); j += 1
+                end
+                @test header == ["Parameter", "Estimate"]
+
+                sheet = xf["Summary"]
+                labels = String[]
+                r = 1
+                while !ismissing(sheet[r, 1])
+                    push!(labels, sheet[r, 1]); r += 1
+                end
+                @test "BHHH matrix" in labels
+                @test "Covariance matrix" in labels
+                pos = 0
+                for label in labels
+                    idx = findnext(label, printed, pos + 1)
+                    @test idx !== nothing
+                    idx === nothing || (pos = first(idx))
+                end
             end
         end
     end
@@ -206,11 +314,16 @@ end
         # the summary line exists to show: convergence alone does not mean the
         # standard errors are usable.
         @test results.hessian === :singular
+        # Both gates fire on this model, and that is not a coincidence: the score
+        # w.r.t. asc1 is (y₁ − p₁) and w.r.t. asc2 is its exact negative, so the
+        # score outer product is rank-deficient in the same direction the Hessian
+        # is flat. No covariance matrix is computed.
+        @test results.bhhh_matrix === :singular
+        @test results.vcov === nothing
+        @test results.std_errors === nothing
 
-        # The summary block must surface it, not just the (scrollable) @warn.
-        printed = capture_stdout(() -> summarize_results(results))
-        @test occursin("Hessian at optimum", printed)
-        @test occursin("SINGULAR", printed)
+        # ...and summarizing is refused rather than rendering pseudo-inverse SEs.
+        @test_throws ErrorException summarize_results(results)
 
         # The identified counterpart must NOT warn, so the check isn't just noisy.
         asc = Parameter(:asc, value=0.0)
@@ -228,7 +341,7 @@ end
         @test results.loglikelihood ≈ r_ok.loglikelihood atol=1e-6
     end
 
-    @testset "estimate returns all three estimators" begin
+    @testset "estimate returns all three estimators (BHHH returned, not reported)" begin
         Random.seed!(5)
         N = 200
         x1, x2 = randn(N), randn(N)
