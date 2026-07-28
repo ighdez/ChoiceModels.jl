@@ -401,56 +401,25 @@ function estimate(model::MixedLogitModel, choicevar::Symbol; verbose::Bool = tru
 
     ForwardDiff.hessian!(H, f_obj, θ̂, cfg)
 
-    vcov = try 
-            inv(H)
-        catch
-            pinv(H)
-    end
-    
-    d = diag(vcov)
-    bad = free_names[findall(<(0), d)]
-    if !isempty(bad)
-        @warn "Non-positive-definite Hessian: negative variance for $(bad); reporting NaN standard error(s). These parameters are likely not identified."
-    end
-    std_errors = [dᵢ < 0 ? NaN : sqrt(dᵢ) for dᵢ in d]
-
-    se = Dict{Symbol, Real}()
-    for (i, name) in enumerate(free_names)
-        se[name] = std_errors[i]
-    end
-
-    if verbose
-        println("Computing Robust Standard Errors")
-    end
+    # `covariance_estimates` builds all three estimators at once (classical,
+    # sandwich, BHHH/OPG), so the score Jacobian must be ready before it is
+    # called — not just before the robust block, as it used to be.
     ForwardDiff.jacobian!(scores,f_obj_i, θ̂)  # N × K
-    G = scores' * scores  # K × K    
+    G = scores' * scores  # K × K
 
-    V_rob = try
-        inv(H) * G * inv(H)
-    catch
-        pinv(H) * G * pinv(H)
-    end
-
-    d_rob = diag(V_rob)
-    bad_rob = free_names[findall(<(0), d_rob)]
-    if !isempty(bad_rob)
-        @warn "Non-positive-definite robust covariance: negative variance for $(bad_rob); reporting NaN robust standard error(s). These parameters are likely not identified."
-    end
-    rob_std_errors = [dᵢ < 0 ? NaN : sqrt(dᵢ) for dᵢ in d_rob]
-
-    rob_se = Dict{Symbol, Real}()
-    for (i, name) in enumerate(free_names)
-        rob_se[name] = rob_std_errors[i]
-    end
+    cov = covariance_estimates(H, G, free_names)
 
     t_end = time()
     return (
         result = result,
         parameters = estimated_params,
-        std_errors = se,
-        vcov = vcov,
-        rob_std_errors = rob_se,
-        rob_vcov = V_rob,
+        std_errors = cov.std_errors,
+        vcov = cov.vcov,
+        rob_std_errors = cov.rob_std_errors,
+        rob_vcov = cov.rob_vcov,
+        bhhh_std_errors = cov.bhhh_std_errors,
+        bhhh_vcov = cov.bhhh_vcov,
+        hessian = cov.status,
         null_loglikelihood = ll0,
         loglikelihood = -Optim.minimum(result),
         iters = Optim.iterations(result),

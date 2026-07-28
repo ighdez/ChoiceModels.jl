@@ -49,16 +49,28 @@ using DataFrames
     end
 
     @testset "estimate and predict" begin
-        model = LogitModel([V1, V2]; data=df, availability=availability)
+        # `estimate` needs its own fixture: in the 2-observation `df` above the
+        # lower-time alternative is always chosen, so the model separates
+        # perfectly, β_time runs off to -Inf and the Hessian goes flat. That is a
+        # genuinely unidentified fit, and `hessian_status` rightly warns about it
+        # — which would be permanent noise in the suite. These four observations
+        # break the separation.
+        df_est = DataFrame(time1 = [10.0, 20.0, 12.0, 8.0],
+                           time2 = [15.0,  5.0,  9.0, 14.0],
+                           CHOICE = [1, 2, 1, 2])
+        avail_est = [trues(4), trues(4)]
+
+        model = LogitModel([V1, V2]; data=df_est, availability=avail_est)
         results = estimate(model, :CHOICE; verbose=false)
 
         @test results.converged
-        @test results.N == 2
+        @test results.N == 4
         @test haskey(results.parameters, :asc)
         @test haskey(results.parameters, :β_time)
+        @test all(isfinite, values(results.std_errors))
 
         preds = predict(model, results)
-        @test size(preds) == (2, 2)
+        @test size(preds) == (4, 2)
         @test all(0.0 .<= preds .<= 1.0)
         @test all(abs.(sum(preds, dims=2) .- 1.0) .< 1e-10)
     end

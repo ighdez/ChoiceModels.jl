@@ -93,6 +93,205 @@ function collect_draws(utilities::Vector{<:DCMExpression})
     return collect(keys(seen))
 end
 
+# ---------------------------------------------------------------------------
+# Shared standard-error machinery
+#
+# All three `estimate` functions used to inline the same guarded `sqrt.(diag(V))`
+# logic (6 near-identical sites), which is exactly the kind of duplication that
+# lets a fix land in one model and not the other two. They now share these.
+# ---------------------------------------------------------------------------
+
+# `inv` throws on an exactly singular matrix; the pseudo-inverse at least gives
+# something the diagonal checks below can reject.
+_safe_inv(A::AbstractMatrix) = try inv(A) catch; pinv(A) end
+
+"""
+Turns a variance-covariance matrix into standard errors, reporting `NaN` for any
+negative diagonal entry rather than throwing a `DomainError` out of `sqrt`.
+
+A negative variance means the matrix is not positive definite. That is worth
+investigating (it usually points at the likelihood or the optimizer's stopping
+point, not necessarily at identification) but it should not abort a run that has
+already converged.
+
+# Arguments
+- `V::AbstractMatrix`: variance-covariance matrix
+- `free_names::Vector{Symbol}`: free parameter names, in the same order as `V`
+- `what::AbstractString`: label used in the warning (e.g. `"robust covariance"`)
+
+# Returns
+- `Vector{Float64}`: standard errors, `NaN` where the variance was negative
+"""
+function guarded_std_errors(V::AbstractMatrix, free_names::AbstractVector{Symbol}, what::AbstractString)
+    d = diag(V)
+    bad = free_names[findall(<(0), d)]
+    if !isempty(bad)
+        @warn "Non-positive-definite $what: negative variance for $(bad); reporting NaN standard error(s)."
+    end
+    return [dᵢ < 0 ? NaN : sqrt(dᵢ) for dᵢ in d]
+end
+
+"""
+Classifies the Hessian at the optimum as `:posdef`, `:indefinite` or `:singular`,
+and warns (naming the parameters responsible) when it is not positive definite.
+
+**This is tested on the eigenvalues of `H` itself, not on the diagonal of
+`inv(H)`.** The diagonal test only catches an *indefinite* Hessian; a merely
+**singular** one — the signature of a parameter that is not identified — inverts
+through `pinv` to a matrix with a perfectly non-negative diagonal, so it yields
+confident-looking finite standard errors and no complaint at all. Two free ASCs
+in a 2-alternative logit reproduce this: only their difference is identified, yet
+each is reported with a tidy SE roughly half that of the identified single-ASC
+version. Whatever else changes here, keep the check on `H`.
+
+The two failure modes mean different things and are reported separately:
+
+- `:indefinite` — `H` has a genuinely **negative** eigenvalue, so the optimizer
+  stopped somewhere that is not a local maximum (a saddle, or a numerically
+  broken likelihood — this is what the softmax-underflow bug produced). The
+  parameters loading on that eigenvector define the direction of wrong curvature.
+- `:singular` — `H` has a **zero** eigenvalue (to working precision), so the
+  likelihood is flat in some direction: that combination of parameters is not
+  identified by the data. The eigenvector names the combination.
+
+# Arguments
+- `H::AbstractMatrix`: Hessian of the **negative** log-likelihood at the optimum
+- `free_names::Vector{Symbol}`: free parameter names, in the same order as `H`
+
+# Returns
+- `Symbol`: `:posdef`, `:indefinite`, or `:singular`
+"""
+function hessian_status(H::AbstractMatrix, free_names::AbstractVector{Symbol}; rtol::Real = 1e-10)
+    k = size(H, 1)
+    k == 0 && return :posdef
+
+    # ForwardDiff Hessians come back with roundoff-level asymmetry; symmetrize so
+    # `eigen` returns real eigenvalues and the classification is stable.
+    M = Matrix(H)
+    F = eigen(Symmetric((M .+ M') ./ 2))
+    λ = F.values
+    λmax = maximum(abs, λ)
+
+    # An eigenvalue counts as zero when it is negligible RELATIVE to the largest.
+    #
+    # The textbook rank tolerance `k * eps * λmax` is far too tight here and was
+    # measured to miss real cases: a Hessian accumulated by AD over N observations
+    # carries much more roundoff than that idealized bound. On the two-free-ASC
+    # example below (true zero eigenvalue, λmax ≈ 160) `eigen` returns 2.6e-13
+    # while `eigvals` on the same matrix returns 2.1e-16 — both are numerically
+    # zero, but they straddle a `k*eps*λmax` tolerance of 1.1e-13, so the check
+    # silently passed. `rtol = 1e-10` sits above that noise floor while still
+    # leaving eight orders of magnitude before a merely ill-conditioned (but
+    # identified) model would trip it.
+    tol = rtol * max(λmax, one(λmax))
+
+    negative = findall(<(-tol), λ)
+    flat     = findall(x -> abs(x) <= tol, λ)
+
+    isempty(negative) && isempty(flat) && return :posdef
+
+    # Parameters carrying the offending direction(s): those with a non-trivial
+    # loading on the corresponding eigenvector.
+    culprits(idxs) = unique(reduce(vcat, [
+        free_names[abs.(F.vectors[:, i]) .> 0.1 * maximum(abs, F.vectors[:, i])]
+        for i in idxs
+    ]; init = Symbol[]))
+
+    if !isempty(negative)
+        @warn """
+              The Hessian is NOT positive definite at the reported optimum: $(length(negative)) \
+              of $(k) eigenvalue(s) are negative (smallest $(minimum(λ))).
+              Parameters involved: $(culprits(negative)).
+              This means the optimizer stopped at a point that is not a local maximum, so the \
+              standard errors below are not trustworthy — the log-likelihood itself may be fine, \
+              but check the convergence trace, the starting values, and the likelihood for \
+              numerical problems before reporting these estimates.
+              """
+        return :indefinite
+    end
+
+    @warn """
+          The Hessian is singular at the reported optimum: $(length(flat)) of $(k) eigenvalue(s) \
+          are zero to working precision.
+          Parameters involved: $(culprits(flat)).
+          The likelihood is flat in that direction, i.e. that combination of parameters is NOT \
+          identified by the data — a classic cause is two free alternative-specific constants \
+          where only their difference is identified. Standard errors for those parameters are \
+          computed from a pseudo-inverse and are meaningless; fix one of the parameters (or drop \
+          it) and re-estimate.
+          """
+    return :singular
+end
+
+"""
+Computes all three maximum-likelihood covariance estimators at the optimum, plus
+the `hessian_status` verdict.
+
+The three are the standard trio, each a different estimator of the *same*
+asymptotic covariance:
+
+- **classical** `inv(H)` — inverse observed information.
+- **robust / sandwich** `inv(H) G inv(H)` — White; valid under misspecification.
+- **BHHH / OPG** `inv(G)` where `G = Σᵢ sᵢsᵢ'` — positive semi-definite **by
+  construction**, so it survives a Hessian that isn't.
+
+They are computed and reported **side by side, never substituted for one
+another**. An earlier version swapped BHHH into the classical slot when `H` was
+not positive definite and tagged the result with a `vcov_method` field; that was
+a mistake. The package's whole reporting contract is that "Classic" and "Robust"
+name two specific, comparable estimators — a column whose meaning silently
+changes between runs breaks exactly the comparison it exists to support. Note
+also that when `H` is bad the *robust* column is equally bad, since it is built
+from the same `inv(H)`; a fallback in one column would have implied the other was
+fine. `hessian_status` is what tells you whether to trust them, and BHHH is
+offered as its own clearly-labelled third set.
+
+# Arguments
+- `H::AbstractMatrix`: Hessian of the **negative** log-likelihood at the optimum
+- `G::AbstractMatrix`: outer product of the per-observation score vectors
+- `free_names::Vector{Symbol}`: free parameter names, in the same order as `H`
+
+# Returns
+- `NamedTuple` with `status`, and `vcov`/`std_errors`, `rob_vcov`/`rob_std_errors`,
+  `bhhh_vcov`/`bhhh_std_errors` (the `*_std_errors` entries are `Dict`s keyed by
+  parameter name)
+"""
+function covariance_estimates(H::AbstractMatrix, G::AbstractMatrix, free_names::AbstractVector{Symbol})
+    status = hessian_status(H, free_names)
+
+    H_inv = _safe_inv(H)
+
+    # Each estimator keeps its own identity. In particular the classical column is
+    # ALWAYS inv(H) — the BHHH matrix is never substituted into it, because the
+    # whole point of printing classical next to robust is that the reader knows
+    # what each one is and can compare them.
+    vcov      = H_inv
+    rob_vcov  = H_inv * G * H_inv
+    bhhh_vcov = _safe_inv(G)
+
+    as_dict(v) = Dict{Symbol, Real}(name => v[i] for (i, name) in enumerate(free_names))
+
+    return (
+        status          = status,
+        vcov            = vcov,
+        std_errors      = as_dict(guarded_std_errors(vcov,      free_names, "Hessian-based covariance")),
+        rob_vcov        = rob_vcov,
+        rob_std_errors  = as_dict(guarded_std_errors(rob_vcov,  free_names, "robust covariance")),
+        bhhh_vcov       = bhhh_vcov,
+        bhhh_std_errors = as_dict(guarded_std_errors(bhhh_vcov, free_names, "BHHH/OPG covariance")),
+    )
+end
+
+"""
+One-line human-readable rendering of a `hessian_status` verdict, for the model
+summary block.
+"""
+_hessian_label(status::Symbol) =
+    status === :posdef     ? "positive definite" :
+    status === :indefinite ? "NOT POS. DEFINITE (not a maximum)" :
+    status === :singular   ? "SINGULAR (parameters unidentified)" :
+                             string(status)
+
 """
 Pretty-prints estimation results and optionally writes them to an Excel file.
 
@@ -146,13 +345,36 @@ function summarize_results(results::NamedTuple; file::Union{String, Nothing}=not
         push!(df, (string(name), value, se_c, t_c, p_c, se_r, t_r, p_r))
     end
 
-    # Imprime resultados clásicos
+    # Imprime resultados clásicos. This heading always means inv(H) — no estimator
+    # is ever substituted underneath it (see `covariance_estimates`).
     println("Classic Standard Errors")
     println(@sprintf("%-20s %10s %14s %10s %10s", "Parameter", "Estimate", "Std. Error", "t-Stat", "P-value"))
     println(repeat("-", 70))
     for row in eachrow(df)
         println(@sprintf("%-20s %10.4f %12.4f %10.4f %10.4f",
             row.Parameter, row.Estimate, row.StdError, row.tStat, row.PValue))
+    end
+
+    # BHHH/OPG is printed only when the Hessian failed — and as its OWN block, not
+    # in place of the classical column. When `H` is indefinite both blocks above
+    # are built from `inv(H)` and are unusable, while `G = Σᵢ sᵢsᵢ'` stays PSD by
+    # construction, so this is the only one of the three still worth reading.
+    # Deliberately NOT printed for a `:singular` Hessian: `G` is rank-deficient in
+    # the same direction there, so BHHH is degenerate too and showing it would
+    # suggest a way out that does not exist.
+    if get(results, :hessian, nothing) === :indefinite && haskey(results, :bhhh_std_errors)
+        se_bhhh = results.bhhh_std_errors
+        println("\nBHHH/OPG Standard Errors  <-- the Hessian is not positive definite, so the")
+        println("                              classical and robust blocks (both built from")
+        println("                              inv(H)) are unreliable; these are not.")
+        println(@sprintf("%-20s %10s %14s %10s %10s", "Parameter", "Estimate", "BHHH SE", "t-Stat", "P-value"))
+        println(repeat("-", 70))
+        for (name, value) in sort(collect(params); by=first)
+            se_b = get(se_bhhh, name, NaN)
+            t_b  = value / se_b
+            p_b  = 2 * (1 - cdf(Normal(), abs(t_b)))
+            println(@sprintf("%-20s %10.4f %12.4f %10.4f %10.4f", string(name), value, se_b, t_b, p_b))
+        end
     end
 
     # Imprime resultados robustos
@@ -174,12 +396,20 @@ function summarize_results(results::NamedTuple; file::Union{String, Nothing}=not
     rho2 = isfinite(ll0) ? 1 - ll / ll0 : NaN
 
 
+    # The Hessian verdict sits next to `Converged` on purpose: "converged" alone
+    # is not enough to trust the standard errors, and the `@warn` it also emits
+    # scrolls past above a long optimizer trace.
+    hessian = get(results, :hessian, nothing)
+
     # Imprime resumen
     println("\nModel Summary")
     println(@sprintf("Log-likelihood at optimum  : %10.4f", ll))
     println(@sprintf("Null Log-likelihood.       : %10.4f", ll0))
     println(@sprintf("Iterations                 : %10d", iters))
     println(@sprintf("Converged                  : %10s", converged))
+    if !isnothing(hessian)
+        println(@sprintf("Hessian at optimum         : %10s", _hessian_label(hessian)))
+    end
     println(@sprintf("Estimation time (seconds)  : %10.2f", estimation_time))
     println(@sprintf("Number of free parameters  : %10d", free_params))
     println(@sprintf("Number of observations     : %10d", N))
@@ -218,6 +448,9 @@ function summarize_results(results::NamedTuple; file::Union{String, Nothing}=not
             sheet2[8,1:2] = ["AIC", aic]
             sheet2[9,1:2] = ["BIC", bic]
             sheet2[10,1:2] = ["Rho-squared", rho2]
+            if !isnothing(hessian)
+                sheet2[11,1:2] = ["Hessian at optimum", _hessian_label(hessian)]
+            end
         end
     end
 end
