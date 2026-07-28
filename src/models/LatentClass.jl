@@ -18,6 +18,8 @@ Constructs a `LatentClassModel` from a symbolic latent-class expression.
 - `parameters`: optional parameter values (leaf `Parameter` values take precedence)
 - `check_class_weights`: verify at construction that the class weights form a
   valid probability distribution (default `true`); see `_check_class_weights`
+- `check_class_separation`: warn at construction when two classes are identical
+  at the starting values (default `true`); see `_check_class_separation`
 
 # Returns
 - `LatentClassModel` instance
@@ -27,18 +29,28 @@ function LatentClassModel(
     data::DataFrame,
     idvar::Union{Nothing,Symbol}=nothing,
     parameters::Dict = Dict(),
-    check_class_weights::Bool = true
+    check_class_weights::Bool = true,
+    check_class_separation::Bool = true
 )
 
+    # Both checks evaluate at the leaf `Parameter` values, which is what
+    # `estimate` uses as θ₀ (falling back to `parameters` for anything not on a
+    # leaf).
+    if check_class_weights || check_class_separation
+        init = merge(parameters, Dict(p.name => p.value for p in collect_parameters(expression)))
+    end
+
     if check_class_weights
-        # Evaluate the weights at the leaf `Parameter` values, which is what
-        # `estimate` uses as θ₀ (falling back to `parameters` for anything not
-        # on a leaf). A spec whose weights don't sum to 1 is a modelling error,
-        # and catching it here is far cheaper than reading it off a converged
-        # but meaningless log-likelihood.
-        init = Dict(p.name => p.value for p in collect_parameters(expression))
-        _check_class_weights(expression, data, merge(parameters, init),
-                             "the initial parameter values")
+        # A spec whose weights don't sum to 1 is a modelling error, and catching it
+        # here is far cheaper than reading it off a converged but meaningless
+        # log-likelihood. Throws.
+        _check_class_weights(expression, data, init, "the initial parameter values")
+    end
+
+    if check_class_separation
+        # Classes that coincide at θ₀ can be an invariant subspace of the
+        # optimization. Warns only — the spec is valid, the start is just bad.
+        _check_class_separation(expression, data, init)
     end
 
     if !isnothing(idvar)
@@ -164,6 +176,91 @@ function _check_class_weights(
           """
 
     strict ? error(msg) : @warn msg
+    return nothing
+end
+
+"""
+Warns when two latent classes are indistinguishable at the starting values.
+
+Starting every class-specific parameter at the same value (typically `0`) leaves
+the classes identical at θ₀, and that is worse than a merely poor start. Measured
+on a two-class fixture: with the classes identical **and** the class weights equal,
+the gradients w.r.t. the two classes' parameters are **bitwise identical** and the
+gradient w.r.t. the weight parameter is **exactly zero** (the likelihood does not
+depend on the weights when the classes coincide). BFGS starts from an identity
+inverse Hessian, so its direction is `-g`, which is symmetric — both classes are
+moved by the same amount at every iteration and `{class 1 = class 2}` is an
+**invariant subspace**, not merely a stationary point. In exact arithmetic the
+classes can never separate; any escape is driven by floating-point asymmetry.
+
+Unequal weights break the tie (the gradients become proportional to the weights
+rather than equal), so the warning distinguishes the two cases.
+
+Detection is on the **class-conditional choice probabilities, not the parameter
+values**: classes are indistinguishable exactly when their probabilities coincide.
+Comparing parameter values would flag equal-valued parameters that enter different
+utilities, and miss different parameterisations that imply the same probabilities.
+
+Deliberately a **warning, not an error** — unlike invalid class weights, this is a
+numerical risk and not a specification error. The model is valid, and the estimates
+are valid if the optimizer does escape (both `LC2_*.jl` examples used to). Throwing
+would reject specifications that work.
+
+Silently skipped when the expression is not a canonical `Σ_c weight * model` sum.
+
+# Arguments
+- `expr`: the latent-class expression
+- `data`: `DataFrame` the class probabilities are evaluated against
+- `parameters`: parameter values to evaluate at (the starting values)
+- `atol::Real = 1e-10`: tolerance on the largest per-cell probability difference
+"""
+function _check_class_separation(
+    expr::DCMExpression,
+    data::DataFrame,
+    parameters::AbstractDict;
+    atol::Real = 1e-10
+)
+    classes = _lc_classes(expr)
+    classes === nothing && return nothing
+    length(classes) < 2 && return nothing
+
+    probs   = [evaluate(m, data, parameters) for (_, m) in classes]
+    weights = [evaluate(w, data, parameters) for (w, _) in classes]
+
+    identical = Tuple{Int,Int}[]
+    stuck     = Tuple{Int,Int}[]
+    for i in 1:length(probs)-1, j in i+1:length(probs)
+        maximum(abs.(probs[i] .- probs[j])) > atol && continue
+        push!(identical, (i, j))
+        # Equal weights as well: the gradients coincide exactly and the pair cannot
+        # separate except through roundoff.
+        maximum(abs.(weights[i] .- weights[j])) <= atol && push!(stuck, (i, j))
+    end
+
+    isempty(identical) && return nothing
+
+    detail = isempty(stuck) ? """
+             Their class weights differ at the starting values, which does break the symmetry \
+             — the gradients are proportional to the weights rather than equal — so the \
+             optimizer should still separate them.
+             """ : """
+             Class pair(s) $(stuck) ALSO start with equal class weights. That combination is \
+             the bad one: the gradients w.r.t. the two classes' parameters are then identical \
+             and the gradient w.r.t. the weight parameters is exactly zero, so BFGS moves both \
+             classes by the same amount at every step. The set of points where those classes \
+             are equal is an invariant subspace of the optimization — in exact arithmetic the \
+             classes can never separate, and any escape is floating-point luck.
+             """
+
+    @warn """
+          Latent classes $(identical) have IDENTICAL choice probabilities at the starting \
+          values, so they are indistinguishable at θ₀.
+          $(detail)
+          Give the classes different starting values — seeding the slope parameters apart is \
+          best, since that also gives the class-weight parameters a non-zero gradient (e.g. \
+          `b_1 = -0.1` against `b_2 = -0.05`). Pass `check_class_separation=false` to silence \
+          this.
+          """
     return nothing
 end
 

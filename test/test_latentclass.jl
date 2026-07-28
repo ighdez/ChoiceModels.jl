@@ -121,6 +121,51 @@ end
         @test lc_ll ≈ mnl_ll rtol=1e-10
     end
 
+    @testset "identical classes at the starting values are flagged" begin
+        # The shared fixture seeds the classes apart, so it must stay silent —
+        # otherwise the check is just noise on every well-formed model.
+        @test_logs LatentClassModel(lc_expr; data=df, idvar=:ID)
+
+        # All class parameters at the same value: the classes coincide at θ₀.
+        # Equal weights too (delta_1 = delta_2 = 0), which is the invariant-subspace
+        # case — the gradients coincide exactly and BFGS cannot separate them.
+        z_b1, z_b2 = Parameter(:b1, value=0.0), Parameter(:b2, value=0.0)
+        z_a1, z_a2 = Parameter(:a1, value=0.0), Parameter(:a2, value=0.0)
+        z_d1 = Parameter(:delta_1, value=0.0)
+        z_d2 = Parameter(:delta_2, value=0.0, fixed=true)
+        z_m1 = LogitModel([z_b1 * Variable(:x1) + z_a1, z_b1 * Variable(:x2), z_b1 * Variable(:x3)];
+                          data=df, availability=avail)
+        z_m2 = LogitModel([z_b2 * Variable(:x1) + z_a2, z_b2 * Variable(:x2), z_b2 * Variable(:x3)];
+                          data=df, availability=avail)
+        z_expr = (exp(z_d1) / (exp(z_d1) + exp(z_d2))) * z_m1 +
+                 (exp(z_d2) / (exp(z_d1) + exp(z_d2))) * z_m2
+
+        msg = (:warn,)
+        @test_logs msg match_mode=:any LatentClassModel(z_expr; data=df, idvar=:ID)
+
+        # It warns rather than throwing: the spec is valid, the start is just bad,
+        # and both LC examples used to escape it. A usable model must come back.
+        m = (@test_logs msg match_mode=:any LatentClassModel(z_expr; data=df, idvar=:ID))
+        @test m isa LatentClassModel
+        @test isfinite(sum(loglikelihood(m, Y; parameters=Dict(
+            :b1 => 0.0, :b2 => 0.0, :a1 => 0.0, :a2 => 0.0, :delta_1 => 0.0, :delta_2 => 0.0))))
+
+        # Escape hatch.
+        @test_logs LatentClassModel(z_expr; data=df, idvar=:ID, check_class_separation=false)
+
+        # Detection is on the class PROBABILITIES, not the parameter values: these
+        # classes share every parameter value but the parameters enter different
+        # utilities, so the classes are genuinely distinct and must NOT be flagged.
+        s_b = Parameter(:sb, value=0.5)
+        s_m1 = LogitModel([s_b * Variable(:x1), s_b * Variable(:x2), s_b * Variable(:x3)];
+                          data=df, availability=avail)
+        s_m2 = LogitModel([s_b * Variable(:x2), s_b * Variable(:x1), s_b * Variable(:x3)];
+                          data=df, availability=avail)
+        s_expr = (exp(z_d1) / (exp(z_d1) + exp(z_d2))) * s_m1 +
+                 (exp(z_d2) / (exp(z_d1) + exp(z_d2))) * s_m2
+        @test_logs LatentClassModel(s_expr; data=df, idvar=:ID)
+    end
+
     @testset "estimate reports the fields summarize_results needs" begin
         model = LatentClassModel(lc_expr; data=df, idvar=:ID)
         results = estimate(model, :choice; verbose=false)
