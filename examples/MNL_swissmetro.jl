@@ -47,7 +47,7 @@ model = LogitModel(utilities; data=df, availability=availability)
 results = estimate(model, :CHOICE)
 
 # Output results
-summarize_results(results)
+summarize_results(results, file="output/MNL_swissmetro.xlsx")
 println('\n')
 
 # Evaluate WTP
@@ -57,7 +57,7 @@ expressions = Dict(
 )
 
 wtp = evaluate(expressions, model, results)
-summarize_expressions(wtp)
+summarize_expressions(wtp, file="output/MNL_swissmetro_WTP.xlsx")
 
 # Predict
 preds = predict(model,results)

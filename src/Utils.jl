@@ -105,6 +105,14 @@ end
 # something the diagonal checks below can reject.
 _safe_inv(A::AbstractMatrix) = try inv(A) catch; pinv(A) end
 
+# Create the directory an export path points at, so `file="output/x.xlsx"` works
+# without the caller having to mkdir first. No-op for a bare filename.
+function _ensure_dir(file::AbstractString)
+    dir = dirname(file)
+    isempty(dir) || mkpath(dir)
+    return nothing
+end
+
 """
 Turns a variance-covariance matrix into standard errors, reporting `NaN` for any
 negative diagonal entry rather than throwing a `DomainError` out of `sqrt`.
@@ -285,11 +293,15 @@ end
 """
 One-line human-readable rendering of a `hessian_status` verdict, for the model
 summary block.
+
+Kept to ≤10 characters so it right-aligns in the same column as the numeric
+values in the Model Summary block; the diagnosis (which parameters, and why) is
+in the `@warn` that `hessian_status` already emitted.
 """
 _hessian_label(status::Symbol) =
-    status === :posdef     ? "positive definite" :
-    status === :indefinite ? "NOT POS. DEFINITE (not a maximum)" :
-    status === :singular   ? "SINGULAR (parameters unidentified)" :
+    status === :posdef     ? "pos. def." :
+    status === :indefinite ? "INDEFINITE" :
+    status === :singular   ? "SINGULAR" :
                              string(status)
 
 """
@@ -324,101 +336,118 @@ function summarize_results(results::NamedTuple; file::Union{String, Nothing}=not
     converged = results.converged
     estimation_time = results.estimation_time
 
+    hessian = get(results, :hessian, nothing)
+
+    # BHHH/OPG is included only when the Hessian failed — and as its OWN columns,
+    # never in place of the classical ones. When `H` is indefinite both the
+    # classical and the robust figures are built from `inv(H)` and are unusable,
+    # while `G = Σᵢ sᵢsᵢ'` stays PSD by construction, so this is the one of the
+    # three still worth reading. Deliberately EXCLUDED for a `:singular` Hessian:
+    # `G` is rank-deficient in the same direction there, so BHHH is degenerate too
+    # and showing it would suggest a way out that does not exist.
+    show_bhhh = hessian === :indefinite && haskey(results, :bhhh_std_errors)
+
     println("Estimation Results\n==================\n")
 
-    # Prepara DataFrame con resultados
-    df = DataFrame(Parameter=String[], Estimate=Float64[],
-                   StdError=Float64[], tStat=Float64[], PValue=Float64[],
-                   RobustSE=Float64[], Robust_tStat=Float64[], Robust_PValue=Float64[])
+    # ---- one estimates table, used for BOTH the console blocks and the export --
+    # Building the console output and the Excel sheet from the same `df` is what
+    # keeps them from drifting apart; they used to be assembled independently.
+    _p(t) = 2 * (1 - cdf(Normal(), abs(t)))
 
-    for (name, value) in sort(collect(params); by=first)
-        # Clásicos
-        se_c = get(se_dict, name, NaN)
-        t_c  = value / se_c
-        p_c  = 2 * (1 - cdf(Normal(), abs(t_c)))
+    rows = sort(collect(params); by=first)
+    pname = String[]; est = Float64[]
+    sc = Float64[]; tc = Float64[]; pc = Float64[]
+    sr = Float64[]; tr = Float64[]; pr = Float64[]
+    sb = Float64[]; tb = Float64[]; pb = Float64[]
 
-        # Robustos
-        se_r = get(se_robust, name, NaN)
-        t_r  = value / se_r
-        p_r  = 2 * (1 - cdf(Normal(), abs(t_r)))
+    for (name, value) in rows
+        push!(pname, string(name)); push!(est, value)
 
-        push!(df, (string(name), value, se_c, t_c, p_c, se_r, t_r, p_r))
-    end
-
-    # Imprime resultados clásicos. This heading always means inv(H) — no estimator
-    # is ever substituted underneath it (see `covariance_estimates`).
-    println("Classic Standard Errors")
-    println(@sprintf("%-20s %10s %14s %10s %10s", "Parameter", "Estimate", "Std. Error", "t-Stat", "P-value"))
-    println(repeat("-", 70))
-    for row in eachrow(df)
-        println(@sprintf("%-20s %10.4f %12.4f %10.4f %10.4f",
-            row.Parameter, row.Estimate, row.StdError, row.tStat, row.PValue))
-    end
-
-    # BHHH/OPG is printed only when the Hessian failed — and as its OWN block, not
-    # in place of the classical column. When `H` is indefinite both blocks above
-    # are built from `inv(H)` and are unusable, while `G = Σᵢ sᵢsᵢ'` stays PSD by
-    # construction, so this is the only one of the three still worth reading.
-    # Deliberately NOT printed for a `:singular` Hessian: `G` is rank-deficient in
-    # the same direction there, so BHHH is degenerate too and showing it would
-    # suggest a way out that does not exist.
-    if get(results, :hessian, nothing) === :indefinite && haskey(results, :bhhh_std_errors)
-        se_bhhh = results.bhhh_std_errors
-        println("\nBHHH/OPG Standard Errors  <-- the Hessian is not positive definite, so the")
-        println("                              classical and robust blocks (both built from")
-        println("                              inv(H)) are unreliable; these are not.")
-        println(@sprintf("%-20s %10s %14s %10s %10s", "Parameter", "Estimate", "BHHH SE", "t-Stat", "P-value"))
-        println(repeat("-", 70))
-        for (name, value) in sort(collect(params); by=first)
-            se_b = get(se_bhhh, name, NaN)
-            t_b  = value / se_b
-            p_b  = 2 * (1 - cdf(Normal(), abs(t_b)))
-            println(@sprintf("%-20s %10.4f %12.4f %10.4f %10.4f", string(name), value, se_b, t_b, p_b))
+        s = get(se_dict, name, NaN);   push!(sc, s); push!(tc, value / s); push!(pc, _p(value / s))
+        s = get(se_robust, name, NaN); push!(sr, s); push!(tr, value / s); push!(pr, _p(value / s))
+        if show_bhhh
+            s = get(results.bhhh_std_errors, name, NaN)
+            push!(sb, s); push!(tb, value / s); push!(pb, _p(value / s))
         end
     end
 
-    # Imprime resultados robustos
-    println("\nRobust Standard Errors (Sandwich)")
-    println(@sprintf("%-20s %10s %14s %10s %10s", "Parameter", "Estimate", "Robust SE", "t-Stat", "P-value"))
-    println(repeat("-", 70))
-    for row in eachrow(df)
-        println(@sprintf("%-20s %10.4f %12.4f %10.4f %10.4f",
-            row.Parameter, row.Estimate, row.RobustSE, row.Robust_tStat, row.Robust_PValue))
+    df = DataFrame(Parameter=pname, Estimate=est, StdError=sc, tStat=tc, PValue=pc)
+    if show_bhhh
+        df.BHHH_SE = sb; df.BHHH_tStat = tb; df.BHHH_PValue = pb
+    end
+    df.RobustSE = sr; df.Robust_tStat = tr; df.Robust_PValue = pr
+
+    function print_block(title, se_col, t_col, p_col, se_header)
+        println(title)
+        println(@sprintf("%-20s %10s %14s %10s %10s", "Parameter", "Estimate", se_header, "t-Stat", "P-value"))
+        println(repeat("-", 70))
+        for row in eachrow(df)
+            println(@sprintf("%-20s %10.4f %12.4f %10.4f %10.4f",
+                row.Parameter, row.Estimate, row[se_col], row[t_col], row[p_col]))
+        end
     end
 
-    # Parámetros adicionales
+    # This heading always means inv(H) — no estimator is ever substituted
+    # underneath it (see `covariance_estimates`).
+    print_block("Classic Standard Errors", :StdError, :tStat, :PValue, "Std. Error")
+
+    if show_bhhh
+        println("\n(The Hessian is not positive definite, so the classical and robust figures —")
+        println(" both built from inv(H) — are unreliable. These BHHH/OPG ones are not.)")
+        print_block("BHHH/OPG Standard Errors", :BHHH_SE, :BHHH_tStat, :BHHH_PValue, "BHHH SE")
+    end
+
+    println()
+    print_block("Robust Standard Errors (Sandwich)", :RobustSE, :Robust_tStat, :Robust_PValue, "Robust SE")
+
+    # ---- one summary table, likewise shared -----------------------------------
     free_params = length(se_dict)
-    N = results.N               # <- asegúrate de incluir esto en el NamedTuple
+    N = results.N
     ll0 = results.null_loglikelihood
 
     aic = -2 * ll + 2 * free_params
     bic = -2 * ll + log(N) * free_params
     rho2 = isfinite(ll0) ? 1 - ll / ll0 : NaN
 
-
-    # The Hessian verdict sits next to `Converged` on purpose: "converged" alone
-    # is not enough to trust the standard errors, and the `@warn` it also emits
-    # scrolls past above a long optimizer trace.
-    hessian = get(results, :hessian, nothing)
-
-    # Imprime resumen
-    println("\nModel Summary")
-    println(@sprintf("Log-likelihood at optimum  : %10.4f", ll))
-    println(@sprintf("Null Log-likelihood.       : %10.4f", ll0))
-    println(@sprintf("Iterations                 : %10d", iters))
-    println(@sprintf("Converged                  : %10s", converged))
+    # (label, raw value for Excel, pre-formatted 10-wide text for the console).
+    # Pre-formatting here rather than at the print site is what lets one list feed
+    # both outputs — `@sprintf` needs a literal format string, so the alternative
+    # would be duplicating the row list.
+    summary = Tuple{String,Any,String}[
+        ("Log-likelihood at optimum", ll,    @sprintf("%10.4f", ll)),
+        ("Null Log-likelihood",       ll0,   @sprintf("%10.4f", ll0)),
+        ("Iterations",                iters, @sprintf("%10d",   iters)),
+        ("Converged",                 converged, @sprintf("%10s", converged)),
+    ]
+    # Sits next to `Converged` on purpose: "converged" alone is not enough to
+    # trust the standard errors, and the `@warn` scrolls past above a long trace.
     if !isnothing(hessian)
-        println(@sprintf("Hessian at optimum         : %10s", _hessian_label(hessian)))
+        push!(summary, ("Hessian at optimum", _hessian_label(hessian),
+                        @sprintf("%10s", _hessian_label(hessian))))
     end
-    println(@sprintf("Estimation time (seconds)  : %10.2f", estimation_time))
-    println(@sprintf("Number of free parameters  : %10d", free_params))
-    println(@sprintf("Number of observations     : %10d", N))
-    println(@sprintf("AIC                        : %10.2f", aic))
-    println(@sprintf("BIC                        : %10.2f", bic))
-    println(@sprintf("Rho-squared (McFadden)     : %10.4f", rho2))
+    append!(summary, Tuple{String,Any,String}[
+        ("Estimation time (seconds)", estimation_time, @sprintf("%10.2f", estimation_time)),
+        ("Number of free parameters", free_params,     @sprintf("%10d",   free_params)),
+        ("Number of observations",    N,               @sprintf("%10d",   N)),
+        ("AIC",                       aic,             @sprintf("%10.2f", aic)),
+        ("BIC",                       bic,             @sprintf("%10.2f", bic)),
+        ("Rho-squared (McFadden)",    rho2,            @sprintf("%10.4f", rho2)),
+    ])
+
+    println("\nModel Summary")
+    for (label, _, text) in summary
+        println(@sprintf("%-27s: %s", label, text))
+    end
+
+    if !isnothing(hessian) && hessian !== :posdef
+        println("\nNOTE: the Hessian is not positive definite, so the standard errors above are")
+        println("      unreliable. See the warning issued during estimation for the parameters")
+        println("      involved.")
+    end
 
     # Exporta a Excel si se especifica
     if !isnothing(file)
+        _ensure_dir(file)
         XLSX.openxlsx(file, mode="w") do xf
             # Hoja de resultados
             sheet = xf[1]
@@ -435,21 +464,11 @@ function summarize_results(results::NamedTuple; file::Union{String, Nothing}=not
                 end
             end
 
-            # Hoja resumen
+            # Hoja resumen — same rows, same labels, same order as the console.
             XLSX.addsheet!(xf, "Summary")
             sheet2 = xf["Summary"]
-            sheet2[1,1:2] = ["Log-likelihood at optimum", ll]
-            sheet2[2,1:2] = ["Null Log-likelihood", ll0]
-            sheet2[3,1:2] = ["Iterations", iters]
-            sheet2[4,1:2] = ["Converged", converged]
-            sheet2[5,1:2] = ["Estimation time (s)", estimation_time]
-            sheet2[6,1:2] = ["Number of free parameters", free_params]
-            sheet2[7,1:2] = ["Number of observations", N]
-            sheet2[8,1:2] = ["AIC", aic]
-            sheet2[9,1:2] = ["BIC", bic]
-            sheet2[10,1:2] = ["Rho-squared", rho2]
-            if !isnothing(hessian)
-                sheet2[11,1:2] = ["Hessian at optimum", _hessian_label(hessian)]
+            for (i, (label, value, _)) in enumerate(summary)
+                sheet2[i, 1:2] = [label, value]
             end
         end
     end
@@ -511,6 +530,7 @@ function summarize_expressions(results::Dict{Symbol,<:NamedTuple}; file::Union{S
 
     # Exportar a Excel si se especifica
     if !isnothing(file)
+        _ensure_dir(file)
         XLSX.openxlsx(file, mode="w") do xf
             sheet = xf[1]
             XLSX.rename!(sheet,"Expressions")

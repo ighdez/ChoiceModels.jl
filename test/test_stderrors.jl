@@ -2,6 +2,7 @@ using Test
 using ChoiceModels
 using DataFrames
 using LinearAlgebra
+using XLSX
 using Random
 
 # `summarize_results` prints straight to stdout rather than taking an `io`, so
@@ -113,12 +114,12 @@ end
 
         pd = capture_stdout(() -> summarize_results(fake_results(hessian=:posdef)))
         @test occursin("Hessian at optimum", pd)
-        @test occursin("positive definite", pd)
+        @test occursin("pos. def.", pd)
         @test !occursin("BHHH", pd)                 # no extra block when nothing is wrong
 
         # Indefinite: BHHH is the one estimator still worth reading, so show it.
         indef = capture_stdout(() -> summarize_results(fake_results(hessian=:indefinite)))
-        @test occursin("NOT POS. DEFINITE", indef)
+        @test occursin("INDEFINITE", indef)
         @test occursin("BHHH/OPG Standard Errors", indef)
 
         # Singular: G is rank-deficient in the same direction, so BHHH is degenerate
@@ -126,6 +127,61 @@ end
         sing = capture_stdout(() -> summarize_results(fake_results(hessian=:singular)))
         @test occursin("SINGULAR", sing)
         @test !occursin("BHHH/OPG Standard Errors", sing)
+    end
+
+    @testset "console and Excel export stay in step" begin
+        # These two used to be assembled from separate hand-written lists and had
+        # already drifted (differing labels, different row order, the Hessian row
+        # only in one). They now come from a single `summary` list — this pins it.
+        mktempdir() do dir
+            path = joinpath(dir, "nested", "out.xlsx")   # also exercises _ensure_dir
+            printed = capture_stdout(() -> summarize_results(fake_results(hessian=:posdef); file=path))
+            @test isfile(path)                            # nested dir created for us
+
+            XLSX.openxlsx(path) do xf
+                sheet = xf["Summary"]
+                labels = String[]
+                r = 1
+                while !ismissing(sheet[r, 1])
+                    push!(labels, sheet[r, 1])
+                    r += 1
+                end
+                @test !isempty(labels)
+                # Every exported summary label appears in the console output, in
+                # the same order.
+                pos = 0
+                for label in labels
+                    idx = findnext(label, printed, pos + 1)
+                    @test idx !== nothing
+                    idx === nothing || (pos = first(idx))
+                end
+                @test "Hessian at optimum" in labels
+            end
+        end
+
+        # When BHHH is shown it must reach the spreadsheet too, not just the console.
+        mktempdir() do dir
+            path = joinpath(dir, "out.xlsx")
+            printed = capture_stdout(() -> summarize_results(fake_results(hessian=:indefinite); file=path))
+            @test occursin("BHHH/OPG Standard Errors", printed)
+            XLSX.openxlsx(path) do xf
+                header = [xf["Estimates"][1, j] for j in 1:11]
+                @test "BHHH_SE" in header
+                @test "RobustSE" in header
+                @test "StdError" in header
+            end
+        end
+
+        # ...and must be absent from both when it is not applicable.
+        mktempdir() do dir
+            path = joinpath(dir, "out.xlsx")
+            printed = capture_stdout(() -> summarize_results(fake_results(hessian=:posdef); file=path))
+            @test !occursin("BHHH", printed)
+            XLSX.openxlsx(path) do xf
+                header = [xf["Estimates"][1, j] for j in 1:8]
+                @test !("BHHH_SE" in header)
+            end
+        end
     end
 
     @testset "singular Hessian is detected on a real unidentified model" begin
@@ -165,7 +221,7 @@ end
         @test r_ok.hessian === :posdef
         @test all(isfinite, values(r_ok.std_errors))
         @test all(>(0), values(r_ok.std_errors))
-        @test occursin("positive definite", capture_stdout(() -> summarize_results(r_ok)))
+        @test occursin("pos. def.", capture_stdout(() -> summarize_results(r_ok)))
 
         # Same fit either way — the redundancy costs nothing in likelihood, which
         # is exactly why it is easy to miss without the Hessian check.

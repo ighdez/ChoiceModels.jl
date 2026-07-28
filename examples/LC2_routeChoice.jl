@@ -67,7 +67,7 @@ results = estimate(lc_model, :choice)
 # @show results
 
 # Output results
-summarize_results(results)
+summarize_results(results, file="output/LC2_routeChoice.xlsx")
 
 # # Predict probabilities
 # probs = predict(model)

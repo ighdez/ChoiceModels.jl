@@ -44,7 +44,7 @@ model = LogitModel(utilities; data=df, availability=availability)
 results = estimate(model, :choice)
 
 # Output results
-summarize_results(results)
+summarize_results(results, file="output/MNL_modeChoice_SP_WTP.xlsx")
 
 # Predict
 preds = predict(model,results)

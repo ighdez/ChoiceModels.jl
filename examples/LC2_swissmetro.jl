@@ -80,5 +80,5 @@ lc_model = LatentClassModel(prob_indiv;data=df,idvar=:ID)
 results = estimate(lc_model, :CHOICE)
 
 # Output results
-summarize_results(results)
+summarize_results(results, file="output/LC2_swissmetro.xlsx")
 println('\n')

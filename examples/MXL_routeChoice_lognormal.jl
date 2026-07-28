@@ -51,7 +51,7 @@ results = estimate(model, :choice)
 # @show results
 
 # Output results
-summarize_results(results)
+summarize_results(results, file="output/MXL_routeChoice_lognormal.xlsx")
 
 # # Predict probabilities
 # probs = predict(model)

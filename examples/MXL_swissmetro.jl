@@ -64,7 +64,7 @@ model = MixedLogitModel(utilities; idvar=:ID, data=df, availability=availability
 results = estimate(model, :CHOICE)
 
 # Output results
-summarize_results(results)
+summarize_results(results, file="output/MXL_swissmetro.xlsx")
 
 # Predict
 # preds = predict(model,results)
