@@ -356,6 +356,99 @@ function _recode_choices(choice_data, alternatives::NamedTuple, choicevar::Symbo
     return positions
 end
 
+"""
+Builds the "no availability restrictions" default: every alternative available in
+every row.
+
+This is the documented meaning of omitting `availability`, but it used to be
+represented as an *empty* vector, which every `logit_prob`-style loop then indexed
+as `availability[j]` — so the default crashed (`UndefRefError`/`BoundsError`)
+instead of applying no restrictions. Materializing the trues keeps the hot loops
+free of an `isempty` branch, and `BitVector <: AbstractVector{Bool}` so the field
+type is unchanged.
+
+# Arguments
+- `alternatives::NamedTuple`: the model's alternatives
+- `data::DataFrame`: the estimation data, whose row count sets the vector length
+"""
+_default_availability(alternatives::NamedTuple, data::DataFrame) =
+    [trues(nrow(data)) for _ in 1:length(alternatives)]
+
+# ---------------------------------------------------------------------------
+# Estimation space vs model space
+#
+# Nested Logit is the first model whose parameters are searched in a different
+# space from the one they are reported in: λ must stay strictly positive, so the
+# optimizer works on θ = log λ. These helpers are the whole mechanism — models
+# whose two spaces coincide pass an all-`false` mask and are unaffected.
+#
+# Deliberately *not* an `if name in nest_params` inlined into `estimate`: the
+# transform has to be applied in four places that must agree (θ₀, the objective
+# closures, the reported estimates, and the covariance matrices), and that is
+# exactly the kind of thing this package has already been bitten by duplicating.
+# ---------------------------------------------------------------------------
+
+"""
+Maps one free parameter from the estimation space to the model space.
+
+`log_scale` marks the parameters the optimizer searches as logs; for those the
+model-space value is `exp(θ)`, and for everything else it is `θ` itself.
+"""
+_model_space_value(θi, log_scale::Bool) = log_scale ? exp(θi) : θi
+
+"""
+The inverse: the estimation-space starting value for a model-space one. Used to
+translate `Parameter(:λ, value=1.0)` into θ₀ = log 1 = 0.
+"""
+function _estimation_space_value(v, log_scale::Bool, name::Symbol)
+    if log_scale
+        v > 0 || error("""
+                       Parameter $name is estimated on a log scale, so its starting value must be \
+                       strictly positive, but it is $v.
+                       """)
+        return log(v)
+    end
+    return v
+end
+
+"""
+The diagonal Jacobian `D = diag(∂model/∂estimation)` at the optimum: `λ̂` in the
+log-scale slots (since `∂exp(θ)/∂θ = exp(θ) = λ̂`) and `1` everywhere else.
+"""
+_space_jacobian(θ̂::AbstractVector, log_scale::AbstractVector{Bool}) =
+    Diagonal([log_scale[i] ? exp(θ̂[i]) : one(float(eltype(θ̂))) for i in eachindex(θ̂)])
+
+"""
+Re-expresses the Hessian and the outer-product-of-scores matrix in the model space,
+so that **every** covariance estimator built from them comes out in the space the
+parameters are reported in.
+
+With `D` the diagonal Jacobian above, the scores transform as `s_model = s_est / λ̂`
+and hence `H_model = D⁻¹ H_est D⁻¹`, `G_model = D⁻¹ G_est D⁻¹`. The second-derivative
+term of the transform drops out because the gradient vanishes at the optimum.
+
+Converting `H` and `G` *before* `covariance_estimates` — rather than converting the
+classical `vcov` after it — is what makes the robust and BHHH matrices come out right
+too: the sandwich `D H⁻¹ G H⁻¹ D` and `D G⁻¹ D` follow automatically, whereas patching
+only the classical matrix would silently leave the robust column in the wrong space.
+
+`D` is invertible, and congruence preserves both inertia and rank, so
+`hessian_status` and `bhhh_matrix_status` return the same verdict in either space.
+
+# Returns
+- `(H_model, G_model)`, or the inputs unchanged when no parameter is transformed
+"""
+function curvature_in_model_space(
+    H::AbstractMatrix,
+    G::AbstractMatrix,
+    θ̂::AbstractVector,
+    log_scale::AbstractVector{Bool}
+)
+    any(log_scale) || return H, G
+    Dinv = inv(_space_jacobian(θ̂, log_scale))
+    return Dinv * H * Dinv, Dinv * G * Dinv
+end
+
 # ---------------------------------------------------------------------------
 # Shared standard-error machinery
 #

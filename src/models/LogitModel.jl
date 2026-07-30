@@ -56,8 +56,10 @@ function LogitModel(
     alts, named = _resolve_alternatives(alternatives)
     utils = _check_utilities(_match_alternatives(alts, named, utilities, "utilities"))
     # An empty `availability` is the "no restrictions" default rather than a
-    # mismatch against the alternatives, so it skips the matching entirely.
-    avail = isempty(availability) ? AbstractVector{Bool}[] :
+    # mismatch against the alternatives, so it skips the matching entirely and
+    # materializes all-available vectors instead — leaving the field empty made
+    # `availability[j]` in `logit_prob` throw, so the documented default crashed.
+    avail = isempty(availability) ? _default_availability(alts, data) :
             _check_availability(_match_alternatives(alts, named, availability, "availability"), data)
 
     return LogitModel(alts, utils, avail, data, parameters)
@@ -255,7 +257,11 @@ function estimate(
     # Initial guess only for free params
     θ0 = [init_values[n] for n in free_names]
 
-    mutable_parameters = deepcopy(model.parameters)
+    # `Dict{Symbol,Any}`, not `deepcopy`: the objective closures below write
+    # ForwardDiff `Dual`s into this dict, which a user-supplied `parameters` dict
+    # typed as `Dict{Symbol,Float64}` cannot hold (it raised a `MethodError` from
+    # `convert`). The value type has to admit Duals regardless of what was passed.
+    mutable_parameters = Dict{Symbol,Any}(model.parameters)
 
     function f_obj_i(θ)
         @inbounds begin

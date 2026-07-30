@@ -216,6 +216,23 @@ function _reorder_alternatives(m::MixedLogitModel, alts::NamedTuple)
     )
 end
 
+# The nesting tree refers to alternatives by name, so it is already independent of
+# the column order and can be handed to the constructor untouched; only the
+# per-alternative vectors are permuted, and the plan is rebuilt from them.
+function _reorder_alternatives(m::NestedLogitModel, alts::NamedTuple)
+    keys(m.alternatives) == keys(alts) && return m
+    perm = _alternative_permutation(m.alternatives, alts)
+    return NestedLogitModel(
+        alts,
+        m.utilities[perm],
+        m.availability[perm],
+        m.tree,
+        _nl_plan(m.tree, alts, m.availability[perm]),
+        m.data,
+        m.parameters
+    )
+end
+
 _reorder_alternatives(m::DiscreteChoiceModel, alts::NamedTuple) = error("""
     Latent class models of type $(typeof(m)) cannot be reordered onto a common alternative \
     ordering. Build every class with its `alternatives` written in the same order.
@@ -534,7 +551,11 @@ function estimate(model::LatentClassModel, choicevar::Symbol; verbose::Bool = tr
     end
 
     θ0 = [init_values[n] for n in free_names]
-    mutable_parameters = deepcopy(model.parameters)
+    # `Dict{Symbol,Any}`, not `deepcopy`: the objective closures below write
+    # ForwardDiff `Dual`s into this dict, which a user-supplied `parameters` dict
+    # typed as `Dict{Symbol,Float64}` cannot hold (it raised a `MethodError` from
+    # `convert`). The value type has to admit Duals regardless of what was passed.
+    mutable_parameters = Dict{Symbol,Any}(model.parameters)
 
     function f_obj_i(θ)
         @inbounds for (i, name) in enumerate(free_names)

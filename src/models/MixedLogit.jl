@@ -61,7 +61,10 @@ function MixedLogitModel(
 
     alts, named = _resolve_alternatives(alternatives)
     utils = _check_utilities(_match_alternatives(alts, named, utilities, "utilities"))
-    avail = isempty(availability) ? AbstractVector{Bool}[] :
+    # See `_default_availability`: an omitted `availability` means "all available",
+    # which has to be materialized because the probability loops index it per
+    # alternative.
+    avail = isempty(availability) ? _default_availability(alts, data) :
             _check_availability(_match_alternatives(alts, named, availability, "availability"), data)
 
     # Get id variable
@@ -326,7 +329,11 @@ function estimate(model::MixedLogitModel, choicevar::Symbol; verbose::Bool = tru
     θ0 = [init_values[n] for n in free_names]
 
     # Preallocate mutable parameter set (no deepcopy of full model)
-    mutable_parameters = deepcopy(model.parameters)
+    # `Dict{Symbol,Any}`, not `deepcopy`: the objective closures below write
+    # ForwardDiff `Dual`s into this dict, which a user-supplied `parameters` dict
+    # typed as `Dict{Symbol,Float64}` cannot hold (it raised a `MethodError` from
+    # `convert`). The value type has to admit Duals regardless of what was passed.
+    mutable_parameters = Dict{Symbol,Any}(model.parameters)
 
     function f_obj_i(θ)
         @inbounds begin

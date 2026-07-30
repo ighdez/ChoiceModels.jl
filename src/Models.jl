@@ -19,6 +19,11 @@ abstract type DiscreteChoiceModel <: DCMExpression end
 
 include("models/LogitModel.jl")
 include("models/MixedLogit.jl")
+# Nested Logit before Latent Class: it reuses `null_loglikelihood_mnl` from the
+# Logit file, and `LatentClass.jl` needs `NestedLogitModel` to exist to give it a
+# `_reorder_alternatives` method.
+include("models/NestedLogit.jl")
 include("models/LatentClass.jl")
 
-export LogitModel, MixedLogitModel, LatentClassModel, estimate, predict, loglikelihood
+export LogitModel, MixedLogitModel, NestedLogitModel, LatentClassModel, Nest,
+       estimate, predict, loglikelihood
