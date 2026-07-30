@@ -526,6 +526,24 @@ nl_prob(
 # Cross-sectional `evaluate` for a nested NestedLogitModel term, mirroring the
 # `LogitModel` method — this is what lets an NL serve as a class inside a
 # `LatentClassModel` expression.
+# The symbolic children the `collect_*` walkers descend into when this model is
+# nested inside another expression. See the traversal note in `Utils.jl`.
+#
+# A nested logit is the one model whose parameters are NOT all in `utilities`: the
+# nest scale parameters live in the tree, reachable only through the flattened
+# plan. Returning `utilities` alone would let an NL class inside a latent class
+# contribute its taste parameters but silently drop every λ — which reads as a
+# converged model whose λs never moved off their starting values. Utilities first,
+# then λs, matching `_nl_parameters` so the two agree on order.
+_children(m::NestedLogitModel) =
+    vcat(Vector{DCMExpression}(m.utilities),
+         Vector{DCMExpression}(_nl_lambda_parameters(m.plan)))
+
+# λ is searched as log λ; see the estimation-space discussion in `estimate` below.
+# A latent class containing this model reads this to build its own `log_scale` mask,
+# so the inner model's estimation space survives being nested.
+_log_scale_names(m::NestedLogitModel) = (l.name for l in _nl_lambda_parameters(m.plan))
+
 evaluate(e::NestedLogitModel, data::DataFrame, params::AbstractDict) =
     nl_prob(e.utilities, data, e.availability, e.plan, params)
 
@@ -755,9 +773,15 @@ inconsistent with global random utility maximization, so it is a result to repor
 flag rather than a region to make unreachable. Same instinct as refusing to substitute
 BHHH into the classical column: give the number, and say why to distrust it.
 """
-function _nl_warn_lambda_above_one(model::NestedLogitModel, estimated_params::AbstractDict)
-    over = [(l.name, estimated_params[l.name]) for l in _nl_lambda_parameters(model.plan)
-            if haskey(estimated_params, l.name) && estimated_params[l.name] > 1]
+_nl_warn_lambda_above_one(model::NestedLogitModel, estimated_params::AbstractDict) =
+    _warn_lambda_above_one((l.name for l in _nl_lambda_parameters(model.plan)), estimated_params)
+
+# Takes the λ names rather than a `NestedLogitModel`, so a `LatentClassModel` whose
+# classes are nested logits gets the same diagnosis. It reaches its λs through
+# `collect_log_scale_parameters`, not through a `plan` it does not have.
+function _warn_lambda_above_one(lambda_names, estimated_params::AbstractDict)
+    over = [(n, estimated_params[n]) for n in lambda_names
+            if haskey(estimated_params, n) && estimated_params[n] > 1]
     isempty(over) && return nothing
 
     @warn """

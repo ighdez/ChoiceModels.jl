@@ -1,7 +1,59 @@
+# ---------------------------------------------------------------------------
+# Tree traversal
+#
+# `collect_parameters`, `collect_variables` and `collect_draws` used to carry
+# three near-identical `visit` closures, and only the first of them knew that a
+# model can appear inside an expression — and then only `LogitModel`. A Mixed,
+# Nested or Latent Class model nested in a latent-class expression is none of
+# `DCMBinary`/`DCMUnary`/`LogitModel`, so the walk simply stopped there and the
+# class contributed **no parameters at all**: `estimate` would then optimize over
+# an empty vector and "converge" instantly at the starting values. Silent, not
+# loud, which is what made it worth fixing rather than documenting.
+#
+# The recursion now lives in exactly one place. `_children` reports a node's
+# symbolic children and `_walk` does a pre-order traversal; the three collectors
+# differ only in what they do at each node. A new node type is traversed for free
+# as long as it subtypes `DCMBinary`/`DCMUnary` (children under `.left`/`.right`
+# or `.arg`) or gets its own `_children` method.
+#
+# TRAVERSAL ORDER IS LOAD-BEARING. `collect_parameters` returns `values(seen)` of
+# a `Dict`, whose iteration order follows insertion order, which follows this
+# traversal. That order fixes the layout of θ and therefore of every covariance
+# matrix, so perturbing it would change the optimizer's path and shift the last
+# digits of every recorded log-likelihood. Visit the node first, then its
+# children left-to-right, exactly as the original closures did.
+# ---------------------------------------------------------------------------
+
+# Leaves, and any node that has not declared children.
+_children(::DCMExpression) = ()
+_children(e::DCMBinary) = (e.left, e.right)
+_children(e::DCMUnary)  = (e.arg,)
+
+# An operator node's child is not always an expression: `DCMEqual` is a `DCMBinary`
+# whose `right` is a plain `Real` (the value being compared against), so the walk
+# is handed a bare number. That is a leaf, not an unhandled node type — the old
+# `isa`-ladder ignored it by falling off the end of its `elseif` chain, and
+# dropping this method turns every `Variable(:x) == 3` in a utility into a
+# `MethodError` from deep inside `collect_parameters`.
+_children(::Any) = ()
+
+# Models carry expressions too, but their `_children` methods live in the model
+# files: `DiscreteChoiceModel` does not exist yet when this file is loaded. Same
+# reason `evaluate(::LogitModel, …)` lives in `models/LogitModel.jl`.
+
+function _walk(f, expr)
+    f(expr)
+    for child in _children(expr)
+        _walk(f, child)
+    end
+    return nothing
+end
+
 """
 Extracts all distinct parameters from a list of utility expressions.
 
-Traverses the expression trees and returns all unique instances of `DCMParameter`.
+Traverses the expression trees and returns all unique instances of `DCMParameter`,
+descending into any model nested inside the expressions (as in a latent class).
 
 # Arguments
 - `utilities::Vector{<:DCMExpression}`: vector of symbolic utility expressions
@@ -11,22 +63,10 @@ Traverses the expression trees and returns all unique instances of `DCMParameter
 """
 function collect_parameters(utilities::Vector{<:DCMExpression})
     seen = Dict{Symbol, DCMParameter}()
-    function visit(expr)
-        if expr isa DCMParameter
-            seen[expr.name] = expr
-        elseif expr isa DCMBinary
-            visit(expr.left)
-            visit(expr.right)
-        elseif expr isa DCMUnary
-            visit(expr.arg)
-        elseif expr isa LogitModel
-            for u in expr.utilities
-                visit(u)
-            end
-        end
-    end
     for u in utilities
-        visit(u)
+        _walk(u) do e
+            e isa DCMParameter && (seen[e.name] = e)
+        end
     end
     return collect(values(seen))
 end
@@ -48,18 +88,10 @@ Traverses the expression trees to find all `DCMVariable` symbols.
 """
 function collect_variables(utilities::Vector{<:DCMExpression})
     seen = Dict{Symbol, Bool}()
-    function visit(expr)
-        if expr isa DCMVariable
-            seen[expr.name] = true
-        elseif expr isa DCMBinary
-            visit(expr.left)
-            visit(expr.right)
-        elseif expr isa DCMUnary
-            visit(expr.arg)
-        end
-    end
     for u in utilities
-        visit(u)
+        _walk(u) do e
+            e isa DCMVariable && (seen[e.name] = true)
+        end
     end
     return collect(keys(seen))
 end
@@ -77,21 +109,43 @@ Used for identifying the random terms in Mixed Logit specifications.
 """
 function collect_draws(utilities::Vector{<:DCMExpression})
     seen = Dict{Symbol, Bool}()
-    function visit(expr)
-        if expr isa DCMDraw
-            seen[expr.name] = true
-        elseif expr isa DCMBinary
-            visit(expr.left)
-            visit(expr.right)
-        elseif expr isa DCMUnary
-            visit(expr.arg)
-        end
-    end
     for u in utilities
-        visit(u)
+        _walk(u) do e
+            e isa DCMDraw && (seen[e.name] = true)
+        end
     end
     return collect(keys(seen))
 end
+
+collect_draws(expr::DCMExpression) = collect_draws([expr])
+
+"""
+The names of the parameters that must be **estimated on a log scale**, anywhere in
+an expression — in practice the nest scale parameters λ of any `NestedLogitModel`
+reachable from it.
+
+This exists so a model that merely *contains* another model can honour the inner
+model's estimation space. A `NestedLogitModel` searches θ = log λ because λ > 0 is
+required for `exp(V/λ)` to mean anything (see `NestedLogit.jl`); an NL sitting
+inside a latent class must be searched the same way, or the optimizer wanders into
+λ ≤ 0 and the run dies as a `NaN` log-likelihood mid-line-search.
+
+Models whose reporting and estimation spaces coincide contribute nothing, so the
+resulting mask is all-`false` and `curvature_in_model_space` short-circuits.
+"""
+function collect_log_scale_parameters(expr::DCMExpression)
+    names = Set{Symbol}()
+    _walk(expr) do e
+        for n in _log_scale_names(e)
+            push!(names, n)
+        end
+    end
+    return names
+end
+
+# Default: a node's parameters are estimated in the space they are reported in.
+# `NestedLogitModel` overrides this in its own file.
+_log_scale_names(::DCMExpression) = ()
 
 # ---------------------------------------------------------------------------
 # Alternatives: names, codes, and the observed choice column

@@ -104,4 +104,39 @@ using ForwardDiff
         @test_throws DomainError evaluate(Variable(:x)^p, DataFrame(x=[-2.0]), params)
     end
 
+    # The `collect_*` walkers share one `_children`/`_walk` recursion. `DCMEqual`
+    # is the node that makes that non-trivial: it is a `DCMBinary`, but its
+    # `right` is a plain `Real`, so the traversal is handed a bare number where
+    # every other binary node hands it an expression. The original `isa`-ladder
+    # ignored it by falling off the end of its `elseif` chain; a `_children`
+    # recursion without an `Any` leaf case turns every `Variable(:x) == 3` in a
+    # utility into a `MethodError` from deep inside `collect_parameters`.
+    #
+    # This is not hypothetical: it was introduced during the walker refactor and
+    # the entire suite passed with it in place — only three examples caught it.
+    @testset "walkers handle nodes with non-expression children" begin
+        b = Parameter(:b, value=0.0)
+        df = DataFrame(x = [1.0, 3.0], y = [2.0, 2.0])
+        params = Dict(:b => 2.0)
+
+        eq = b * (Variable(:x) == 3)
+        @test eq isa ChoiceModels.DCMMult
+        @test ChoiceModels.DCMEqual <: ChoiceModels.DCMBinary   # why it is a trap
+
+        # The walk must survive the numeric child and still find what is past it.
+        @test [p.name for p in ChoiceModels.collect_parameters(eq)] == [:b]
+        @test ChoiceModels.collect_variables([eq]) == [:x]
+        @test isempty(ChoiceModels.collect_draws([eq]))
+
+        # ... and the node still evaluates on both paths, indicator-style.
+        @test evaluate(eq, df, params) ≈ [0.0, 2.0]
+        draws = Dict(:d => zeros(2, 2))
+        @test evaluate(b * (Variable(:x) == 3) + Draw(:d), df, params, draws) ≈ [0.0 0.0; 2.0 2.0]
+
+        # A comparison buried under other operators is reached too.
+        deep = exp(b * (Variable(:y) == 2)) + Variable(:x)
+        @test [p.name for p in ChoiceModels.collect_parameters(deep)] == [:b]
+        @test sort(ChoiceModels.collect_variables([deep])) == [:x, :y]
+    end
+
 end

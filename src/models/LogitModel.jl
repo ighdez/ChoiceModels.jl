@@ -123,6 +123,11 @@ end
 evaluate(e::LogitModel, data::DataFrame, params::AbstractDict) =
     logit_prob(e.utilities, data, e.availability, params)
 
+# The symbolic children the `collect_*` walkers descend into when this model is
+# nested inside another expression (a latent class). See the traversal note in
+# `Utils.jl`; defined here because `_children` is called on a type this file owns.
+_children(m::LogitModel) = m.utilities
+
 """
 Computes predicted probabilities using estimated parameters.
 

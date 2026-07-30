@@ -457,3 +457,11 @@ function evaluate(
 )
     error("Evaluate for MixedLogitModel is not implemented yet")
 end
+
+# The symbolic children the `collect_*` walkers descend into when this model is
+# nested inside another expression. See the traversal note in `Utils.jl`.
+#
+# `collect_draws` reaching in here is what lets a `LatentClassModel` discover the
+# draw dimensions its Mixed Logit classes reference, which it needs in order to
+# generate ONE shared draw set for all of them.
+_children(m::MixedLogitModel) = m.utilities

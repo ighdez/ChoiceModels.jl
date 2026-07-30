@@ -243,4 +243,145 @@ end
                                    parameters=merge(params, Dict(:unit_weight => 1.0)))) == I_ind
     end
 
+    # The `collect_*` walkers used to have an explicit `expr isa LogitModel` arm
+    # and nothing else, so a Mixed, Nested or Latent Class model nested in a
+    # latent-class expression contributed NO parameters at all. That failed
+    # silently: `estimate` would optimize over an empty vector and "converge"
+    # instantly at the starting values, reporting a fit it never searched for.
+    @testset "walkers descend into every nested model type" begin
+        pname(e) = sort([p.name for p in ChoiceModels.collect_parameters(e)])
+
+        bx  = Parameter(:b_nested, value=-0.5)
+        lam = Parameter(:lam_nested, value=0.7)
+        w1  = Parameter(:unit_w, value=1.0, fixed=true)
+        U2  = [bx * Variable(:x1), bx * Variable(:x2), bx * Variable(:x3)]
+
+        # `alts` is the plain-vector form, so the alternatives are named alt1..alt3
+        # and the nesting tree refers to them by those names.
+        inner_mnl = LogitModel(alts; utilities=U2, data=df)
+        inner_mxl = MixedLogitModel(alts; utilities=U2, data=df, idvar=:ID, R=4)
+        inner_nl  = NestedLogitModel(alts; utilities=U2,
+                                     tree=[:alt1, Nest(lam, [:alt2, :alt3])], data=df)
+        inner_lc  = LatentClassModel(w1 * inner_mnl; data=df, idvar=:ID)
+
+        # Every model type contributes its parameters when wrapped in an expression.
+        @test pname(1.0 * inner_mnl) == [:b_nested]
+        @test pname(1.0 * inner_mxl) == [:b_nested]
+        @test pname(1.0 * inner_lc)  == [:b_nested, :unit_w]
+
+        # A nested logit is the one whose parameters are NOT all in `utilities` —
+        # λ lives in the tree. Walking `.utilities` alone drops it, which reads as
+        # a converged model whose λ never left its starting value.
+        @test pname(1.0 * inner_nl) == [:b_nested, :lam_nested]
+
+        # The other two walkers descend as well. `collect_draws` reaching into a
+        # class is what lets a latent class discover its Mixed Logit classes'
+        # draw dimensions.
+        @test sort(ChoiceModels.collect_variables([1.0 * inner_nl])) == [:x1, :x2, :x3]
+        @test ChoiceModels.collect_draws([1.0 * inner_mxl]) == Symbol[]
+        mxl_rnd = MixedLogitModel(alts; data=df, idvar=:ID, R=4,
+                                  utilities=[(bx + Draw(:z)) * Variable(:x1),
+                                             bx * Variable(:x2), bx * Variable(:x3)])
+        @test ChoiceModels.collect_draws([1.0 * mxl_rnd]) == [:z]
+
+        # Only a nested logit declares a log-scale estimation space, and it must
+        # survive being nested — otherwise a latent class searches λ unconstrained.
+        @test ChoiceModels.collect_log_scale_parameters(1.0 * inner_nl) == Set([:lam_nested])
+        @test isempty(ChoiceModels.collect_log_scale_parameters(1.0 * inner_mnl))
+    end
+
+    # An NL class must be estimated with λ on a log scale, exactly as a standalone
+    # nested logit is. Two things are pinned: λ̂ stays strictly positive (which an
+    # unconstrained search does not guarantee — it dies as a NaN log-likelihood
+    # the first time the line search steps past zero), and the reported value and
+    # its standard error are in λ space, not log λ space.
+    @testset "nested logit as a latent class" begin
+        # A DEDICATED fixture. The shared one above draws `choice` at random, which
+        # is fine for the hand-rolled likelihood checks but leaves a two-class
+        # NL/MNL mixture completely unidentified: λ̂ collapses to 9e-5 and the BHHH
+        # matrix is (correctly) singular, so no covariance matrix is computed at
+        # all. Suspect the fixture before the code — see the fixture warning under
+        # "Known issues" in CLAUDE.md. Here the choices are simulated FROM the
+        # model, so its parameters are genuinely recoverable.
+        Random.seed!(20260731)
+        I2, T2 = 200, 6
+        ids2 = repeat(1:I2, inner=T2)
+        N2 = length(ids2)
+        df2 = DataFrame(ID=ids2, x1=randn(N2), x2=randn(N2), x3=randn(N2))
+
+        λ_true, b_nl_true = 0.6, -1.2
+        b_mnl_true, a_mnl_true, π_true = 0.9, 0.4, 0.65
+
+        # Class membership is drawn ONCE per individual, which is what makes this
+        # a latent class rather than a per-observation mixture.
+        in_class1 = rand(I2) .< π_true
+        choices2 = Vector{Int}(undef, N2)
+        for n in 1:N2
+            if in_class1[ids2[n]]
+                # Nested logit: alt1 alone against a nest of {alt2, alt3}.
+                V = (b_nl_true * df2.x1[n], b_nl_true * df2.x2[n], b_nl_true * df2.x3[n])
+                e2, e3 = exp(V[2] / λ_true), exp(V[3] / λ_true)
+                iv = λ_true * log(e2 + e3)
+                if rand() < exp(V[1]) / (exp(V[1]) + exp(iv))
+                    choices2[n] = 1
+                else
+                    choices2[n] = rand() < e2 / (e2 + e3) ? 2 : 3
+                end
+            else
+                V = (b_mnl_true * df2.x1[n] + a_mnl_true,
+                     b_mnl_true * df2.x2[n], b_mnl_true * df2.x3[n])
+                p = exp.(V) ./ sum(exp.(V))
+                u = rand()
+                choices2[n] = u < p[1] ? 1 : (u < p[1] + p[2] ? 2 : 3)
+            end
+        end
+        df2.choice = choices2
+        Y2 = zeros(Bool, N2, J)
+        for n in 1:N2
+            Y2[n, choices2[n]] = true
+        end
+
+        bx  = Parameter(:b_nl_lc, value=-1.0)
+        lam = Parameter(:lam_nl_lc, value=0.8)
+        bm  = Parameter(:b_mnl_lc, value=0.7)
+        am  = Parameter(:a_mnl_lc, value=0.2)
+        e1  = Parameter(:e_1, value=0.5)
+        e2p = Parameter(:e_2, value=0.0, fixed=true)
+        U2  = [bx * Variable(:x1), bx * Variable(:x2), bx * Variable(:x3)]
+
+        nl_class = NestedLogitModel(alts; utilities=U2,
+                                    tree=[:alt1, Nest(lam, [:alt2, :alt3])], data=df2)
+        mnl_class = LogitModel(alts; utilities=[bm * Variable(:x1) + am,
+                                                bm * Variable(:x2), bm * Variable(:x3)],
+                               data=df2)
+
+        w1 = exp(e1) / (exp(e1) + exp(e2p))
+        w2 = exp(e2p) / (exp(e1) + exp(e2p))
+        lc = LatentClassModel(w1 * nl_class + w2 * mnl_class; data=df2, idvar=:ID)
+        res = estimate(lc, :choice; verbose=false)
+
+        @test res.converged
+        # Reported in MODEL space: λ̂ > 0 by construction of the transform. An
+        # unconstrained search does not guarantee this — it dies as a NaN
+        # log-likelihood the first time the line search steps past zero.
+        @test res.parameters[:lam_nl_lc] > 0
+        # λ was actually searched. The silent-failure mode this testset exists for
+        # is λ̂ sitting exactly where it started, because the walker never found it.
+        @test res.parameters[:lam_nl_lc] != 0.8
+
+        # A covariance matrix exists, and λ's SE is finite and in λ space.
+        @test res.std_errors !== nothing
+        @test isfinite(res.std_errors[:lam_nl_lc])
+
+        # Recovery, in standard-error units rather than a fixed tolerance — the
+        # same convention as test_nestedlogit.jl, since these parameters differ a
+        # lot in precision.
+        @test abs(res.parameters[:lam_nl_lc] - λ_true) < 3 * res.std_errors[:lam_nl_lc]
+        @test abs(res.parameters[:b_nl_lc] - b_nl_true) < 3 * res.std_errors[:b_nl_lc]
+
+        # Feeding the reported estimates back in must reproduce the reported
+        # log-likelihood. A λ left in θ space would not: exp(θ̂) ≠ θ̂.
+        @test sum(loglikelihood(lc, Y2; parameters=res.parameters)) ≈ res.loglikelihood
+    end
+
 end

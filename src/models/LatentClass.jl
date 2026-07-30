@@ -521,6 +521,11 @@ function predict(model::LatentClassModel, results::NamedTuple)
     return evaluate(model.expr, model.data, results.parameters)
 end
 
+# The symbolic children the `collect_*` walkers descend into. A latent class holds
+# one expression rather than a vector of utilities; see the traversal note in
+# `Utils.jl`.
+_children(m::LatentClassModel) = (m.expr,)
+
 function estimate(model::LatentClassModel, choicevar::Symbol; verbose::Bool = true)
 
     # Parameter setup
@@ -550,7 +555,16 @@ function estimate(model::LatentClassModel, choicevar::Symbol; verbose::Bool = tr
         end
     end
 
-    θ0 = [init_values[n] for n in free_names]
+    # Which free parameters the optimizer searches as logs. A latent class has no
+    # estimation-space transform of its own, but a class model can: a nested logit
+    # searches θ = log λ, and that has to survive being nested here or the λ is
+    # searched unconstrained and the run dies as a `NaN` log-likelihood the first
+    # time the line search steps to λ ≤ 0. With no such class the mask is all
+    # `false` and every transform below is the identity.
+    log_scale_names = collect_log_scale_parameters(model.expr)
+    log_scale = [n in log_scale_names for n in free_names]
+
+    θ0 = [_estimation_space_value(init_values[n], log_scale[i], n) for (i, n) in enumerate(free_names)]
     # `Dict{Symbol,Any}`, not `deepcopy`: the objective closures below write
     # ForwardDiff `Dual`s into this dict, which a user-supplied `parameters` dict
     # typed as `Dict{Symbol,Float64}` cannot hold (it raised a `MethodError` from
@@ -559,7 +573,7 @@ function estimate(model::LatentClassModel, choicevar::Symbol; verbose::Bool = tr
 
     function f_obj_i(θ)
         @inbounds for (i, name) in enumerate(free_names)
-            mutable_parameters[name] = θ[i]
+            mutable_parameters[name] = _model_space_value(θ[i], log_scale[i])
         end
         for name in fixed_names
             mutable_parameters[name] = init_values[name]
@@ -569,7 +583,7 @@ function estimate(model::LatentClassModel, choicevar::Symbol; verbose::Bool = tr
 
     function f_obj(θ)
         @inbounds for (i, name) in enumerate(free_names)
-            mutable_parameters[name] = θ[i]
+            mutable_parameters[name] = _model_space_value(θ[i], log_scale[i])
         end
         for name in fixed_names
             mutable_parameters[name] = init_values[name]
@@ -628,7 +642,7 @@ function estimate(model::LatentClassModel, choicevar::Symbol; verbose::Bool = tr
     θ̂ = Optim.minimizer(result)
     estimated_params = Dict{Symbol, Real}()
     for (i, name) in enumerate(free_names)
-        estimated_params[name] = θ̂[i]
+        estimated_params[name] = _model_space_value(θ̂[i], log_scale[i])
     end
     for name in fixed_names
         estimated_params[name] = init_values[name]
@@ -655,9 +669,19 @@ function estimate(model::LatentClassModel, choicevar::Symbol; verbose::Bool = tr
     ForwardDiff.jacobian!(scores,f_obj_i, θ̂)  # N × K
     G = scores' * scores
 
-    cov = covariance_estimates(H, G, free_names)
+    # Re-express the curvature in the space the estimates are reported in, so every
+    # estimator below — not just the classical one — comes out in λ rather than
+    # log λ. Converting `H` and `G` here rather than patching `vcov` afterwards is
+    # what keeps the *robust* column honest: the sandwich is built from `inv(H)`,
+    # so a post-hoc fix to the classical matrix alone would leave it in θ space
+    # while its heading still said otherwise. No-op when no class carries a λ.
+    Hλ, Gλ = curvature_in_model_space(H, G, θ̂, log_scale)
+
+    cov = covariance_estimates(Hλ, Gλ, free_names)
 
     t_end = time()
+
+    _warn_lambda_above_one(log_scale_names, estimated_params)
 
     return (
         result = result,
