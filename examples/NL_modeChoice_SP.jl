@@ -62,10 +62,10 @@ asc_rail_value = asc_rail + asc_rail_interaction_female * Variable(:female)
 β_time_air_value  = β_time_air  + β_time_interaction_business * Variable(:business)
 β_time_rail_value = β_time_rail + β_time_interaction_business * Variable(:business)
 
-# Apollo writes this as (income/mean_income)^cost_income_elast. `^` on a symbolic
-# expression takes a plain-number exponent (see `DCMPower`), not an estimated
-# parameter, so the identical exp(elast · log(ratio)) form is used instead.
-income_effect = exp(cost_income_elast * log(Variable(:income_ratio)))
+# Written exactly as Apollo writes it: the exponent is an estimated parameter.
+# `^` with a symbolic exponent is rewritten internally to exp(exponent · log(base)),
+# which is exact for a positive base — see the `^` overload in Expressions.jl.
+income_effect = Variable(:income_ratio) ^ cost_income_elast
 β_cost_value = (β_cost + β_cost_interaction_business * Variable(:business)) * income_effect
 
 # Define the alternatives: name => code used in the choice column

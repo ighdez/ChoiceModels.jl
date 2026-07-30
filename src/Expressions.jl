@@ -106,10 +106,16 @@ struct DCMMinus{A<:DCMExpression} <: DCMUnary
 end
 
 """
-Symbolic power of an expression raised to a numeric exponent (`arg ^ exponent`).
+Symbolic power of an expression raised to a **numeric** exponent (`arg ^ exponent`).
 
 Modeled as a `DCMUnary` node (its single symbolic child is `arg`; `exponent` is a
 plain `Real`), so the `collect_*` tree-walkers traverse it automatically.
+
+An exponent that is itself symbolic — an estimated `Parameter`, as in Apollo's
+`(income/mean_income) ^ cost_income_elast` — does **not** build this node. It is
+rewritten to `exp(exponent * log(base))` by the `^` overload below; see there for
+why. So this struct's `exponent` field is always a number, and never a node the
+walkers would need to visit.
 
 # Fields
 - `arg`: symbolic base expression
@@ -133,6 +139,29 @@ exp(a::DCMExpression) = DCMExp(a)
 log(a::DCMExpression) = DCMLog(a)
 -(a::DCMExpression) = DCMMinus(a)
 
+# A SYMBOLIC exponent — one that is itself an expression, typically an estimated
+# `Parameter`, as in Apollo's `(income/mean_income) ^ cost_income_elast`. It is
+# rewritten here into `exp(exponent * log(base))` rather than given a node of its
+# own, because for x > 0 the identity `x^p ≡ exp(p·log x)` is exact, not an
+# approximation: measured agreement is 3.6e-16 (1 ulp), and the two forms have
+# *identical* domain behaviour — a negative base throws `DomainError` either way,
+# including through ForwardDiff, so nothing is made quieter by the rewrite.
+#
+# Given that, a dedicated node would buy nothing numerically while adding the one
+# thing this codebase gets wrong most often: a new node needs BOTH an `evaluate`
+# and an `_evaluate_draws` method, and missing one is a `MethodError` at run time.
+# Desugaring reuses three nodes that already have both paths and are already
+# traversed by `collect_parameters`/`collect_variables`/`collect_draws` — which
+# matters here, since the exponent's parameters have to be found for estimation.
+#
+# The numeric-exponent overload above is deliberately untouched: `x^2` still
+# builds a `DCMPower`, so existing specifications are unchanged.
+#
+# One degenerate difference worth knowing: at a base of exactly 0, `0.0^0.0` is 1
+# whereas `exp(0·log 0)` is `NaN`. Both forms are already degenerate there (the
+# derivative is `NaN` either way), so this is documented rather than guarded.
+^(a::DCMExpression, b::DCMExpression) = DCMExp(DCMMult(b, DCMLog(a)))
+
 +(a::Real, b::DCMExpression) = DCMLiteral(a) + b
 +(a::DCMExpression, b::Real) = a + DCMLiteral(b)
 
@@ -144,6 +173,11 @@ log(a::DCMExpression) = DCMLog(a)
 
 /(a::Real, b::DCMExpression) = DCMLiteral(a) / b
 /(a::DCMExpression, b::Real) = a / DCMLiteral(b)
+
+# A numeric base with a symbolic exponent (`2 ^ β`). Lifting the base to a
+# literal routes it to the symbolic `^` above; there is no `Real ^ Real` method
+# here, so ordinary arithmetic is unaffected.
+^(a::Real, b::DCMExpression) = DCMLiteral(a) ^ b
 
 """
 Represents a named parameter in a utility expression.
