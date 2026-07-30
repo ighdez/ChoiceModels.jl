@@ -25,6 +25,7 @@ struct MixedLogitModel <: DiscreteChoiceModel
     parameters::Dict                                # Initial parameter values (mu, sigma, etc.)
     draws::Dict                                     # Draws: N x R
     R::Int                                          # Number of simulations (draws)
+    draw_scheme::Symbol                             # Scheme the draws were generated with
 end
 
 """
@@ -105,9 +106,21 @@ function MixedLogitModel(
         (id_index_map, id),
         parameters,
         expanded_draws,
-        R
+        R,
+        draw_scheme
     )
 end
+
+"""
+Rebuilds a Mixed Logit onto an externally supplied set of draws.
+
+Used by `LatentClassModel`, which takes over draw generation for its classes so
+that a draw dimension named in two classes really is the same draw — see
+`_lc_share_draws`. Everything but the draws is carried over unchanged.
+"""
+_with_draws(m::MixedLogitModel, draws::Dict, R::Int) =
+    MixedLogitModel(m.alternatives, m.utilities, m.availability, m.data,
+                    m.id, m.parameters, draws, R, m.draw_scheme)
 
 """
 Computes conditional choice probabilities for Mixed Logit using simulation draws.
@@ -465,3 +478,21 @@ end
 # draw dimensions its Mixed Logit classes reference, which it needs in order to
 # generate ONE shared draw set for all of them.
 _children(m::MixedLogitModel) = m.utilities
+
+"""
+Cross-sectional `evaluate` for a nested `MixedLogitModel` term: the **unconditional**
+choice probabilities, `(1/R) Σ_r P(j | β_r)`, as an `N × J` matrix.
+
+WARNING — this is not the quantity a latent-class likelihood may be built from.
+Averaging over draws here collapses the `(N, J, R)` tensor before the product over
+an individual's observations has been taken, and the whole point of a panel Mixed
+Logit is that the product happens *inside* the integral: `log (1/R) Σ_r Π_t P_t(r)`,
+not `Σ_t log (1/R) Σ_r P_t(r)`. `loglikelihood(::LatentClassModel, …)` therefore
+calls `logit_prob` for the full tensor and never this method. What this is for is
+`predict`, and the construction-time class checks (`_check_class_weights`,
+`_check_class_separation`), which legitimately compare unconditional probabilities.
+"""
+function evaluate(e::MixedLogitModel, data::DataFrame, params::AbstractDict)
+    P = logit_prob(e.utilities, data, params, e.availability, e.draws)  # N × J × R
+    return dropdims(sum(P, dims=3), dims=3) ./ size(P, 3)
+end

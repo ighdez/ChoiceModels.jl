@@ -54,6 +54,10 @@ function LatentClassModel(
     # on one column ordering, which the mixture below relies on.
     expression, alternatives = _lc_alternatives(expression, alternatives)
 
+    # Mixed Logit classes are put on one shared set of draws, generated here, so a
+    # draw dimension named in two classes really is the same draw. No-op otherwise.
+    expression = _lc_share_draws(expression, data, idvar)
+
     # Both checks evaluate at the leaf `Parameter` values, which is what
     # `estimate` uses as θ₀ (falling back to `parameters` for anything not on a
     # leaf).
@@ -185,6 +189,103 @@ end
 _same_alternative_mapping(a::NamedTuple, b::NamedTuple) = Dict(pairs(a)) == Dict(pairs(b))
 
 """
+Puts every Mixed Logit class on ONE shared set of draws, generated here.
+
+Each `MixedLogitModel` generates its own draws at construction, which is right for
+a standalone model and wrong for a class: two classes that both reference
+`Draw(:z)` would be handed two *different* `:z` matrices, so the same symbol would
+silently mean different numbers in different classes.
+
+Draw sharing is therefore **by symbol** — the same `Draw` name in two classes is
+the same draw, different names are independent dimensions — which is exactly how
+the analyst controls it in Apollo (a single `interNormDraws=c("draws_tt")` used by
+both classes' random coefficients), with no extra API here.
+
+Generating once also fixes a subtler problem. `generate_draws` assigns Halton bases
+by the *position* of each dimension in the symbol list, so two classes each
+generating one draw dimension independently would both receive base 2 — perfectly
+correlating their random coefficients across classes. One call over the union of
+symbols gives them 2, 3, 5, … in order, as Apollo does.
+
+Settings are inherited from the classes rather than re-declared on the latent
+class, matching how `alternatives` is inherited; classes that disagree are an
+error, since there is no defensible way to pick for the analyst.
+
+Returns the expression unchanged when no class is a Mixed Logit.
+"""
+function _lc_share_draws(expression::DCMExpression, data::DataFrame, idvar)
+    classes = _lc_classes(expression)
+    classes === nothing && return expression
+
+    mxl = [m for (_, m) in classes if m isa MixedLogitModel]
+    isempty(mxl) && return expression
+
+    if isnothing(idvar)
+        error("""
+              This latent class model has Mixed Logit classes, so it needs `idvar`. \
+              Both the class membership and the random coefficients are drawn once per \
+              INDIVIDUAL, and the likelihood multiplies an individual's observations \
+              inside both — there is no coherent per-observation reading of the model. \
+              Pass the same ID column the Mixed Logit classes were built with.
+              """)
+    end
+
+    R = first(mxl).R
+    if !all(m.R == R for m in mxl)
+        error("""
+              The Mixed Logit classes disagree on the number of draws: $(unique(m.R for m in mxl)). \
+              Every class must integrate over the same draws, so give them all the same `R`.
+              """)
+    end
+
+    scheme = first(mxl).draw_scheme
+    if !all(m.draw_scheme == scheme for m in mxl)
+        error("""
+              The Mixed Logit classes disagree on the draw scheme: \
+              $(unique(m.draw_scheme for m in mxl)). Give them all the same `draw_scheme`.
+              """)
+    end
+
+    id = data[:, idvar]
+    if !all(m.id[2] == id for m in mxl)
+        error("""
+              The Mixed Logit classes were built with a different ID column than the one \
+              given to the latent class model (`idvar=:$(idvar)`). Class membership and the \
+              random coefficients must be drawn over the same individuals.
+              """)
+    end
+    @assert issorted(id) "The vector `id` must be sorted to ensure consistent draw assignment."
+
+    # Union of the draw dimensions, in first-seen order across classes. The order
+    # matters — it fixes which Halton base each dimension gets — so it is built by
+    # traversal rather than sorted.
+    syms = Symbol[]
+    for (_, m) in classes
+        for s in collect_draws(collect(DCMExpression, m.utilities))
+            s in syms || push!(syms, s)
+        end
+    end
+
+    individuals = unique(id)
+    draw_struct = generate_draws(syms, length(individuals), R; scheme=scheme)
+
+    # Expand from per-individual to per-observation, as the Mixed Logit constructor does.
+    id_index_map = Dict(pid => idx for (idx, pid) in enumerate(individuals))
+    shared = Dict{Symbol, Matrix{Float64}}()
+    for s in syms
+        per_individual = draw_struct.values[s]
+        expanded = zeros(Float64, nrow(data), R)
+        for (n, pid) in enumerate(id)
+            expanded[n, :] .= per_individual[id_index_map[pid], :]
+        end
+        shared[s] = expanded
+    end
+
+    rebuilt = [(w, m isa MixedLogitModel ? _with_draws(m, shared, R) : m) for (w, m) in classes]
+    return reduce(+, (w * m for (w, m) in rebuilt))
+end
+
+"""
 Rebuilds a class model with its per-alternative fields permuted into the order of
 `alts`. Used only by `_lc_alternatives`, when classes agree on the alternatives
 but were written in different orders.
@@ -212,7 +313,8 @@ function _reorder_alternatives(m::MixedLogitModel, alts::NamedTuple)
         m.id,
         m.parameters,
         m.draws,
-        m.R
+        m.R,
+        m.draw_scheme
     )
 end
 
@@ -428,6 +530,57 @@ function _check_class_separation(
 end
 
 """
+The log probability of an individual's whole observed choice *sequence* under one
+class, as an `I × R` matrix — one row per individual, one column per draw.
+
+This is the contract every class type meets, and it is what the panel latent-class
+likelihood consumes. Stating it as a sequence probability rather than a
+per-observation one is what forces the operators into the right order: an
+individual's observations are multiplied together **first**, and only then are the
+draws averaged and the classes mixed.
+
+A class with no random coefficients returns `R = 1`; the mixing loop skips the
+draw average entirely in that case, so the deterministic path is unchanged.
+"""
+function _class_log_sequence(m, data::DataFrame, Y::Matrix{Bool}, parameters,
+                             id_map::Dict, id::AbstractVector, I::Int)
+    probs = evaluate(m, data, parameters)                                   # N × J
+    lp = log.(max.(sum(probs .* Y, dims=2)[:, 1], 1e-30))                   # N
+    out = zeros(eltype(lp), I, 1)
+    @inbounds for n in eachindex(lp)
+        out[id_map[id[n]], 1] += lp[n]
+    end
+    return out
+end
+
+# Mixed Logit class: the random coefficients belong to the INDIVIDUAL, so the
+# product over their observations has to happen inside the integral, i.e. at fixed
+# `r`. That is why this reads the full `(N, J, R)` tensor rather than the
+# draw-averaged `N × J` matrix `evaluate(::MixedLogitModel, …)` returns — averaging
+# first would give `Σ_t log (1/R) Σ_r P_t(r)`, a different and wrong model. It is
+# the same error as mixing classes per observation instead of per individual, one
+# level further in.
+function _class_log_sequence(m::MixedLogitModel, data::DataFrame, Y::Matrix{Bool}, parameters,
+                             id_map::Dict, id::AbstractVector, I::Int)
+    P = logit_prob(m.utilities, data, parameters, m.availability, m.draws)  # N × J × R
+    N, J, R = size(P)
+    T = eltype(P)
+    out = zeros(T, I, R)
+    @inbounds for r in 1:R
+        for n in 1:N
+            p = zero(T)
+            for j in 1:J
+                if Y[n, j]
+                    p += P[n, j, r]
+                end
+            end
+            out[id_map[id[n]], r] += log(max(p, 1e-30))
+        end
+    end
+    return out
+end
+
+"""
 Computes the log-likelihood of a Latent Class model.
 
 Two regimes, selected by whether the model was built with an `idvar`:
@@ -468,25 +621,52 @@ function loglikelihood(model::LatentClassModel, Y::Matrix{Bool}; parameters::Dic
     C = length(classes)
     N = nrow(model.data)
 
-    # Per class: log P_c(chosen) per observation, and the class weight per observation.
-    log_chosen = [log.(max.(sum(evaluate(m, model.data, parameters) .* Y, dims=2)[:, 1], 1e-30))
-                  for (_, m) in classes]
+    # Per class: log Π_t P_c(j_t | draw r) per individual, as an I × R_c matrix
+    # (R_c = 1 for a class with no random coefficients), and the class weight.
+    seqs    = [_class_log_sequence(m, model.data, Y, parameters, id_map, id, I) for (_, m) in classes]
     weights = [evaluate(w, model.data, parameters) for (w, _) in classes]
 
-    T = promote_type(eltype(first(log_chosen)), eltype(first(weights)))
+    T = promote_type(eltype(first(seqs)), eltype(first(weights)))
 
-    log_seq = zeros(T, I, C)   # log Π_t P_c(j_t) per individual
+    log_seq = zeros(T, I, C)   # log [ (1/R) Σ_r Π_t P_c(j_t | r) ] per individual
     log_w   = zeros(T, I, C)   # log π_c per individual
 
     for c in 1:C
-        lp, π = log_chosen[c], weights[c]
+        seq = seqs[c]
+        R = size(seq, 2)
+        if R == 1
+            # No draws to integrate over. The log-sum-exp below would be exactly the
+            # identity here (log(exp(0)) = 0, and log R = 0), so it is skipped
+            # rather than run — a latent class of plain logits does precisely the
+            # arithmetic it always did, bit for bit.
+            @inbounds for i in 1:I
+                log_seq[i, c] = seq[i, 1]
+            end
+        else
+            # Average the sequence probability over draws INSIDE the class, in logs:
+            # log (1/R) Σ_r exp(Σ_t log P_c(j_t | r)). Sequence probabilities
+            # underflow Float64 within a handful of observations, so this never
+            # leaves log space.
+            logR = log(T(R))
+            @inbounds for i in 1:I
+                mx = -T(Inf)
+                for r in 1:R
+                    mx = max(mx, seq[i, r])
+                end
+                s = zero(T)
+                for r in 1:R
+                    s += exp(seq[i, r] - mx)
+                end
+                log_seq[i, c] = mx + log(s) - logR
+            end
+        end
+
+        π = weights[c]
         @inbounds for n in 1:N
-            i = id_map[id[n]]
-            log_seq[i, c] += lp[n]
             # Class membership is an individual-level quantity; a weight built from
             # individual-level covariates is constant within an individual, so any
             # of their rows gives the same value. We take the last one seen.
-            log_w[i, c] = log(max(π[n], 1e-30))
+            log_w[id_map[id[n]], c] = log(max(π[n], 1e-30))
         end
     end
 

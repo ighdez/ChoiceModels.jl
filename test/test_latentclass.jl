@@ -2,6 +2,7 @@ using Test
 using ChoiceModels
 using DataFrames
 using Random
+using Statistics
 
 # The two things worth pinning about a latent-class model are (a) that the panel
 # likelihood mixes classes ONCE per individual — `Σ_c π_c Π_t P_c(j_t)`, not
@@ -382,6 +383,196 @@ end
         # Feeding the reported estimates back in must reproduce the reported
         # log-likelihood. A λ left in θ space would not: exp(θ̂) ≠ θ̂.
         @test sum(loglikelihood(lc, Y2; parameters=res.parameters)) ≈ res.loglikelihood
+    end
+
+    # ---------------------------------------------------------------------------
+    # Mixed Logit classes (LC-MMNL).
+    #
+    # The likelihood is `Σ_c π_c · (1/R) Σ_r Π_t P_c(j_t | β_cr)`: the product over
+    # an individual's observations is INNERMOST, then the draws are averaged, then
+    # the classes are mixed. That ordering is Apollo's (apollo_mnl → panelProd →
+    # avgInterDraws → lc), and getting it wrong gives a different model rather than
+    # a less accurate one — the same class of error as mixing classes per
+    # observation, one level further in.
+    # ---------------------------------------------------------------------------
+    @testset "mixed logit classes: likelihood ordering" begin
+        Random.seed!(31415)
+        I3, T3, J3, R3 = 15, 4, 2, 9
+        ids3 = repeat(1:I3, inner=T3)
+        N3 = length(ids3)
+        df3 = DataFrame(ID=ids3, x1=randn(N3), x2=randn(N3), choice=rand(1:J3, N3))
+        Y3 = zeros(Bool, N3, J3)
+        for n in 1:N3
+            Y3[n, df3.choice[n]] = true
+        end
+
+        # σ deliberately large: it is what separates the correct ordering from the
+        # wrong ones, and a small σ makes the three nearly coincide.
+        mu = Parameter(:mu3, value=-0.5); sg = Parameter(:sg3, value=1.5)
+        bd = Parameter(:bd3, value=0.6)
+        e1 = Parameter(:e1_3, value=0.3); e2 = Parameter(:e2_3, value=0.0, fixed=true)
+        w1 = exp(e1) / (exp(e1) + exp(e2))
+        w2 = exp(e2) / (exp(e1) + exp(e2))
+        alts3 = (a=1, b=2)
+
+        mxl = MixedLogitModel(alts3; data=df3, idvar=:ID, R=R3, draw_scheme=:halton,
+                              utilities=(a=(mu + sg*Draw(:z3)) * Variable(:x1),
+                                         b=(mu + sg*Draw(:z3)) * Variable(:x2)))
+        mnl = LogitModel(alts3; utilities=(a=bd*Variable(:x1), b=bd*Variable(:x2)), data=df3)
+        lc3 = LatentClassModel(w1*mxl + w2*mnl; data=df3, idvar=:ID,
+                               check_class_separation=false)
+
+        pars3 = Dict(:mu3=>-0.5, :sg3=>1.5, :bd3=>0.6, :e1_3=>0.3, :e2_3=>0.0)
+        got = sum(loglikelihood(lc3, Y3; parameters=pars3))
+
+        # One contribution per INDIVIDUAL, as for every panel latent class.
+        @test length(loglikelihood(lc3, Y3; parameters=pars3)) == I3
+
+        # ---- independent brute force, from the draw matrix rather than logit_prob.
+        # Two-alternative probabilities in the stable logistic form; exp(V)/Σexp(V)
+        # would reproduce a softmax-underflow bug and pass vacuously.
+        zz = ChoiceModels._lc_classes(lc3.expr)[1][2].draws[:z3]   # N × R
+        pchosen(Vc, Vo) = 1 / (1 + exp(Vo - Vc))
+        π1 = exp(0.3) / (exp(0.3) + 1)
+        π2 = 1 / (exp(0.3) + 1)
+        mixed_one(n, r) = begin
+            b = -0.5 + 1.5 * zz[n, r]
+            df3.choice[n] == 1 ? pchosen(b*df3.x1[n], b*df3.x2[n]) :
+                                 pchosen(b*df3.x2[n], b*df3.x1[n])
+        end
+        det_one(n) = df3.choice[n] == 1 ? pchosen(0.6*df3.x1[n], 0.6*df3.x2[n]) :
+                                          pchosen(0.6*df3.x2[n], 0.6*df3.x1[n])
+        rows_of(i)   = findall(==(i), ids3)
+        mixed_obs(n) = sum(mixed_one(n, r) for r in 1:R3) / R3
+
+        reference = sum(log(π1 * (sum(prod(mixed_one(n, r) for n in rows_of(i)) for r in 1:R3) / R3)
+                            + π2 * prod(det_one(n) for n in rows_of(i))) for i in 1:I3)
+        @test got ≈ reference atol=1e-10
+
+        # ---- and it must NOT equal either wrong ordering. Without these the test
+        # would pass under an implementation that averages or mixes at the wrong
+        # level, exactly as the panel testset above would have passed under the
+        # per-observation mixture.
+        wrong_avg_first = sum(log(π1 * prod(mixed_obs(n) for n in rows_of(i))
+                                  + π2 * prod(det_one(n) for n in rows_of(i))) for i in 1:I3)
+        wrong_mix_obs = sum(log(π1 * mixed_obs(n) + π2 * det_one(n)) for n in 1:N3)
+        @test !isapprox(got, wrong_avg_first; atol=1e-4)
+        @test !isapprox(got, wrong_mix_obs;   atol=1e-4)
+    end
+
+    # Two structural anchors, in the spirit of "identical classes collapse to a
+    # plain MNL": make the new machinery degenerate and it must reproduce a model
+    # the package already computes another way.
+    @testset "mixed logit classes: degenerate cases" begin
+        Random.seed!(2718)
+        I4, T4, J4 = 20, 3, 2
+        ids4 = repeat(1:I4, inner=T4)
+        N4 = length(ids4)
+        df4 = DataFrame(ID=ids4, x1=randn(N4), x2=randn(N4), choice=rand(1:J4, N4))
+        Y4 = zeros(Bool, N4, J4)
+        for n in 1:N4
+            Y4[n, df4.choice[n]] = true
+        end
+        Y4_3d = repeat(Y4, outer=(1, 1, 6))   # MixedLogit's own loglikelihood wants N × J × R
+        alts4 = (a=1, b=2)
+
+        # (1) σ ≡ 0 removes the randomness, so the Mixed Logit class is a plain
+        #     logit and the whole model must equal the corresponding LC-MNL.
+        mu = Parameter(:mu4, value=-0.7)
+        s0 = Parameter(:s0_4, value=0.0, fixed=true)
+        bd = Parameter(:bd4, value=0.5)
+        g1 = Parameter(:g1_4, value=0.25); g2 = Parameter(:g2_4, value=0.0, fixed=true)
+        v1 = exp(g1) / (exp(g1) + exp(g2))
+        v2 = exp(g2) / (exp(g1) + exp(g2))
+
+        mxl0 = MixedLogitModel(alts4; data=df4, idvar=:ID, R=6, draw_scheme=:halton,
+                               utilities=(a=(mu + s0*Draw(:z4)) * Variable(:x1),
+                                          b=(mu + s0*Draw(:z4)) * Variable(:x2)))
+        mnl0 = LogitModel(alts4; utilities=(a=mu*Variable(:x1), b=mu*Variable(:x2)), data=df4)
+        other = LogitModel(alts4; utilities=(a=bd*Variable(:x1), b=bd*Variable(:x2)), data=df4)
+
+        p4 = Dict(:mu4=>-0.7, :s0_4=>0.0, :bd4=>0.5, :g1_4=>0.25, :g2_4=>0.0)
+        lc_mxl = LatentClassModel(v1*mxl0 + v2*other; data=df4, idvar=:ID,
+                                  check_class_separation=false)
+        lc_mnl = LatentClassModel(v1*mnl0 + v2*other; data=df4, idvar=:ID,
+                                  check_class_separation=false)
+        @test sum(loglikelihood(lc_mxl, Y4; parameters=p4)) ≈
+              sum(loglikelihood(lc_mnl, Y4; parameters=p4))
+
+        # (2) A single Mixed Logit class at weight 1 is just that Mixed Logit.
+        #     This is the check that the draw average is taken at the right level:
+        #     a per-observation average would not reproduce the standalone model.
+        unit = Parameter(:unit4, value=1.0, fixed=true)
+        sg = Parameter(:sg4, value=0.8)
+        solo = MixedLogitModel(alts4; data=df4, idvar=:ID, R=6, draw_scheme=:halton,
+                               utilities=(a=(mu + sg*Draw(:z4)) * Variable(:x1),
+                                          b=(mu + sg*Draw(:z4)) * Variable(:x2)))
+        lc_solo = LatentClassModel(unit * solo; data=df4, idvar=:ID)
+        p5 = Dict(:mu4=>-0.7, :sg4=>0.8, :unit4=>1.0)
+        # The latent class rebuilt the class onto its own shared draws, so compare
+        # against a Mixed Logit holding those same draws.
+        shared = ChoiceModels._lc_classes(lc_solo.expr)[1][2]
+        @test sum(loglikelihood(lc_solo, Y4; parameters=p5)) ≈
+              sum(loglikelihood(shared, Y4_3d; parameters=p5))
+    end
+
+    # Draw generation is taken over by the latent class so that a draw dimension
+    # named in two classes really is the same draw. Generating per class is not
+    # merely redundant — `generate_draws` assigns Halton bases by the POSITION of
+    # each dimension in the symbol list, so two classes each generating one
+    # dimension independently both receive base 2 and their random coefficients
+    # come out perfectly correlated across classes. Measured: corr = 1.0 before,
+    # ≈ 0 after. Same failure mode as the MLHS shuffle bug in Draws.jl.
+    @testset "mixed logit classes: draws are owned by the latent class" begin
+        Random.seed!(161803)
+        I5, T5 = 30, 3
+        ids5 = repeat(1:I5, inner=T5)
+        N5 = length(ids5)
+        df5 = DataFrame(ID=ids5, x1=randn(N5), x2=randn(N5), choice=rand(1:2, N5))
+        alts5 = (a=1, b=2)
+        sa = Parameter(:sa5, value=0.3); sb = Parameter(:sb5, value=0.3)
+        h1 = Parameter(:h1_5, value=0.2); h2 = Parameter(:h2_5, value=0.0, fixed=true)
+        u1 = exp(h1) / (exp(h1) + exp(h2))
+        u2 = exp(h2) / (exp(h1) + exp(h2))
+
+        mk(sym, par) = MixedLogitModel(alts5; data=df5, idvar=:ID, R=64, draw_scheme=:halton,
+                                       utilities=(a=(par*Draw(sym))*Variable(:x1),
+                                                  b=(par*Draw(sym))*Variable(:x2)))
+
+        # DIFFERENT draw names: independent dimensions, which is only true if one
+        # generator saw both of them.
+        ca, cb = mk(:za5, sa), mk(:zb5, sb)
+        @test cor(vec(ca.draws[:za5]), vec(cb.draws[:zb5])) ≈ 1.0   # the trap, per class
+        lc5 = LatentClassModel(u1*ca + u2*cb; data=df5, idvar=:ID,
+                               check_class_separation=false)
+        cls5 = ChoiceModels._lc_classes(lc5.expr)
+        @test abs(cor(vec(cls5[1][2].draws[:za5]), vec(cls5[2][2].draws[:zb5]))) < 0.05
+
+        # SAME draw name: one shared matrix, so the symbol means one thing.
+        cc, cd = mk(:zs5, sa), mk(:zs5, sb)
+        lc6 = LatentClassModel(u1*cc + u2*cd; data=df5, idvar=:ID,
+                               check_class_separation=false)
+        cls6 = ChoiceModels._lc_classes(lc6.expr)
+        @test cls6[1][2].draws[:zs5] == cls6[2][2].draws[:zs5]
+
+        # Settings are inherited from the classes and must agree; there is no
+        # defensible way to choose for the analyst.
+        wrongR = MixedLogitModel(alts5; data=df5, idvar=:ID, R=32, draw_scheme=:halton,
+                                 utilities=(a=(sb*Draw(:zs5))*Variable(:x1),
+                                            b=(sb*Draw(:zs5))*Variable(:x2)))
+        @test_throws ErrorException LatentClassModel(u1*cc + u2*wrongR; data=df5, idvar=:ID,
+                                                     check_class_separation=false)
+        wrongS = MixedLogitModel(alts5; data=df5, idvar=:ID, R=64, draw_scheme=:mlhs,
+                                 utilities=(a=(sb*Draw(:zs5))*Variable(:x1),
+                                            b=(sb*Draw(:zs5))*Variable(:x2)))
+        @test_throws ErrorException LatentClassModel(u1*cc + u2*wrongS; data=df5, idvar=:ID,
+                                                     check_class_separation=false)
+
+        # A Mixed Logit class makes `idvar` mandatory: both the class membership
+        # and the random coefficients are drawn once per individual, so there is
+        # no coherent per-observation reading of the model.
+        @test_throws ErrorException LatentClassModel(u1*cc + u2*cd; data=df5,
+                                                     check_class_separation=false)
     end
 
 end
