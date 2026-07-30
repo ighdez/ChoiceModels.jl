@@ -60,7 +60,7 @@ using DataFrames
                            CHOICE = [1, 2, 1, 2])
         avail_est = [trues(4), trues(4)]
 
-        model = LogitModel([V1, V2]; data=df_est, availability=avail_est)
+        model = LogitModel([1, 2]; utilities=[V1, V2], availability=avail_est, data=df_est)
         results = estimate(model, :CHOICE; verbose=false)
 
         @test results.converged

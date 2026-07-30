@@ -38,22 +38,25 @@ b_tc = mu_tc + sigma_tc * tc
 b_hw = mu_hw + sigma_hw * hw
 b_ch = mu_ch + sigma_ch * ch
 
-# Define utility functions (alternatives 1, 2)
-V1 = b_tt * Variable(:tt1) + b_tc * Variable(:tc1) + b_hw * Variable(:hw1) + b_ch * Variable(:ch1)
-V2 = b_tt * Variable(:tt2) + b_tc * Variable(:tc2) + b_hw * Variable(:hw2) + b_ch * Variable(:ch2)
+# Define the alternatives: name => code used in the choice column
+alternatives = (route1 = 1, route2 = 2)
 
-utilities = [V1, V2]
+# Define utility functions
+utilities = (
+    route1 = b_tt * Variable(:tt1) + b_tc * Variable(:tc1) + b_hw * Variable(:hw1) + b_ch * Variable(:ch1),
+    route2 = b_tt * Variable(:tt2) + b_tc * Variable(:tc2) + b_hw * Variable(:hw2) + b_ch * Variable(:ch2)
+)
 
 # Availability (assumed all available for simplicity)
-availability = [
-    trues(nrow(df)),
-    trues(nrow(df))
-]
+availability = (
+    route1 = trues(nrow(df)),
+    route2 = trues(nrow(df))
+)
 
 # Build and estimate the Mixed Logit model
 using Random
 Random.seed!(12345)
-model = MixedLogitModel(utilities; data=df, idvar=:ID, availability=availability, R=100, draw_scheme=:mlhs)
+model = MixedLogitModel(alternatives; utilities=utilities, availability=availability, data=df, idvar=:ID, R=100, draw_scheme=:mlhs)
 results = estimate(model, :choice)
 
 # @show results

@@ -17,11 +17,16 @@ using ChoiceModels
 asc = Parameter(:asc_car, value=0.0)
 β_time = Parameter(:β_time, value=0.0)
 
-V1 = asc + β_time * Variable(:time_car)
-V2 = β_time * Variable(:time_bus)
+V_car = asc + β_time * Variable(:time_car)
+V_bus = β_time * Variable(:time_bus)
 
-model = LogitModel([V1, V2]; data=df, availability=[..., ...])
-results = estimate(model, df.choice)
+# `alternatives` maps each name to its code in the choice column; `utilities` and
+# `availability` are matched to it by name.
+model = LogitModel((car = 1, bus = 2);
+                   utilities    = (car = V_car, bus = V_bus),
+                   availability = (car = ..., bus = ...),
+                   data         = df)
+results = estimate(model, :choice)
 P = predict(model, results)
 ```
 

@@ -1,6 +1,18 @@
 using DataFrames
 
+"""
+Data structure for latent class models.
+
+# Fields
+- `alternatives::NamedTuple`: alternative name => code in the choice column, inherited
+  from the class models (see `_lc_alternatives`)
+- `expr::DCMExpression`: the class mixture, normally `Σ_c π_c * model_c`
+- `data::DataFrame`: input dataset
+- `id`: panel structure (`nothing` for cross-sectional data)
+- `parameters::Dict`: parameter values (estimates or fixed)
+"""
 struct LatentClassModel <: DiscreteChoiceModel
+    alternatives::NamedTuple
     expr::DCMExpression
     data::DataFrame
     id::Union{Nothing, Tuple{Dict,Vector}}
@@ -12,6 +24,10 @@ Constructs a `LatentClassModel` from a symbolic latent-class expression.
 
 # Arguments
 - `expression`: the class mixture, normally `Σ_c π_c * model_c`
+- `alternatives`: normally omitted — the alternative set is inherited from the class
+  models, which already declare it. Required only when the expression is not a
+  canonical `Σ_c weight * model` sum, and there is therefore nothing to inherit from;
+  when given alongside class models it is checked against them
 - `data`: `DataFrame` with observations
 - `idvar`: optional ID column. Supplying it selects the **panel** likelihood, in
   which class membership is drawn once per individual (see `loglikelihood`)
@@ -26,12 +42,17 @@ Constructs a `LatentClassModel` from a symbolic latent-class expression.
 """
 function LatentClassModel(
     expression::DCMExpression;
+    alternatives = nothing,
     data::DataFrame,
     idvar::Union{Nothing,Symbol}=nothing,
     parameters::Dict = Dict(),
     check_class_weights::Bool = true,
     check_class_separation::Bool = true
 )
+
+    # The alternative set comes from the class models; this also puts every class
+    # on one column ordering, which the mixture below relies on.
+    expression, alternatives = _lc_alternatives(expression, alternatives)
 
     # Both checks evaluate at the leaf `Parameter` values, which is what
     # `estimate` uses as θ₀ (falling back to `parameters` for anything not on a
@@ -65,6 +86,7 @@ function LatentClassModel(
         id_index_map = Dict(pid => idx for (idx, pid) in enumerate(individuals))
     
         return LatentClassModel(
+            alternatives,
             expression,
             data,
             (id_index_map, id),
@@ -72,12 +94,136 @@ function LatentClassModel(
         )
     else
         return LatentClassModel(
+            alternatives,
             expression,
             data,
             nothing,
             parameters
         )
     end
+end
+
+"""
+Resolves the alternative set of a latent class model, and puts every class on a
+single column ordering.
+
+A latent class model has no utilities of its own: its alternatives are those of
+its class models, which already declare them. So the set is **inherited** rather
+than re-declared — the analyst binds one `alternatives` NamedTuple and passes it
+to each class, and agreement is then automatic. Disagreement is an error: the
+mixture `Σ_c π_c P_c` adds the classes' probability matrices columnwise, so two
+classes describing different alternatives cannot be combined.
+
+Agreement is judged on the name => code **mapping**, not on the order it was
+written in, keeping the promise that order is meaningless everywhere. Order still
+has to be reconciled, though, since each class orders its probability columns by
+its own `alternatives`; classes written in a different order from the canonical
+one are therefore rebuilt here — once, at construction, with no cost in the
+likelihood — and the mixture expression is reassembled from the rebuilt classes.
+
+`alternatives` is only required from the user when the expression is not a
+canonical `Σ_c weight * model` sum, since there is then no class model to inherit
+from. When supplied alongside class models it is checked against them and defines
+the canonical order.
+
+# Returns
+- `(expression, alternatives::NamedTuple)`: the expression (rebuilt only if some
+  class needed reordering) and the resolved alternative set
+"""
+function _lc_alternatives(expression::DCMExpression, alternatives)
+    classes = _lc_classes(expression)
+
+    if classes === nothing
+        if alternatives === nothing
+            error("""
+                  Cannot determine the alternatives of this latent class model: the expression is \
+                  not a sum of `class_probability * class_model` terms, so there are no class \
+                  models to inherit them from. Either write it in that form, or pass the \
+                  alternatives explicitly — `LatentClassModel(expr; alternatives = (car = 1, …), …)`.
+                  """)
+        end
+        return expression, first(_resolve_alternatives(alternatives))
+    end
+
+    class_alts = [m.alternatives for (_, m) in classes]
+    reference = first(class_alts)
+
+    for (c, a) in enumerate(class_alts)
+        if !_same_alternative_mapping(reference, a)
+            error("""
+                  Latent classes 1 and $c describe different alternatives — \
+                  $(_alternatives_str(reference)) versus $(_alternatives_str(a)) — so their choice \
+                  probabilities cannot be mixed. Every class model must be built with the same \
+                  `alternatives`; the simplest way is to bind it once and pass that same value to \
+                  each class.
+                  """)
+        end
+    end
+
+    alts = reference
+    if alternatives !== nothing
+        given = first(_resolve_alternatives(alternatives))
+        if !_same_alternative_mapping(given, reference)
+            error("""
+                  The `alternatives` given to `LatentClassModel` ($(_alternatives_str(given))) do \
+                  not match those of its class models ($(_alternatives_str(reference))). Omit the \
+                  argument to inherit them from the classes, or correct the mismatch.
+                  """)
+        end
+        alts = given
+    end
+
+    # Same mapping, same order everywhere: nothing to reconcile, keep the
+    # expression the user built.
+    all(m -> keys(m.alternatives) == keys(alts), (m for (_, m) in classes)) && return expression, alts
+
+    rebuilt = [(w, _reorder_alternatives(m, alts)) for (w, m) in classes]
+    return reduce(+, (w * m for (w, m) in rebuilt)), alts
+end
+
+# Order-insensitive comparison of two alternative sets: same names, same codes.
+_same_alternative_mapping(a::NamedTuple, b::NamedTuple) = Dict(pairs(a)) == Dict(pairs(b))
+
+"""
+Rebuilds a class model with its per-alternative fields permuted into the order of
+`alts`. Used only by `_lc_alternatives`, when classes agree on the alternatives
+but were written in different orders.
+"""
+function _reorder_alternatives(m::LogitModel, alts::NamedTuple)
+    keys(m.alternatives) == keys(alts) && return m
+    perm = _alternative_permutation(m.alternatives, alts)
+    return LogitModel(
+        alts,
+        m.utilities[perm],
+        isempty(m.availability) ? m.availability : m.availability[perm],
+        m.data,
+        m.parameters
+    )
+end
+
+function _reorder_alternatives(m::MixedLogitModel, alts::NamedTuple)
+    keys(m.alternatives) == keys(alts) && return m
+    perm = _alternative_permutation(m.alternatives, alts)
+    return MixedLogitModel(
+        alts,
+        m.utilities[perm],
+        isempty(m.availability) ? m.availability : m.availability[perm],
+        m.data,
+        m.id,
+        m.parameters,
+        m.draws,
+        m.R
+    )
+end
+
+_reorder_alternatives(m::DiscreteChoiceModel, alts::NamedTuple) = error("""
+    Latent class models of type $(typeof(m)) cannot be reordered onto a common alternative \
+    ordering. Build every class with its `alternatives` written in the same order.
+    """)
+
+function _alternative_permutation(from::NamedTuple, to::NamedTuple)
+    names = collect(keys(from))
+    return [findfirst(==(k), names) for k in keys(to)]
 end
 
 """
@@ -371,13 +517,11 @@ function estimate(model::LatentClassModel, choicevar::Symbol; verbose::Bool = tr
 
     choice_data = model.data[:, choicevar]
 
-    if any(ismissing, choice_data)
-        error("Choice vector contains missing values. Please clean your data.")
-    end
+    # Translate the analyst's alternative codes into positions in `model.alternatives`
+    # once, here; the class probability matrices are all ordered by position.
+    choices = _recode_choices(choice_data, model.alternatives, choicevar)
 
-    choices = Int.(choice_data)
-    
-    J = size(evaluate(model.expr, model.data, init_values), 2)
+    J = length(model.alternatives)
     N = length(choices)
 
     # Build Y: N × J matrix (one-hot)

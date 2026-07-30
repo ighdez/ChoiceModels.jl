@@ -29,18 +29,21 @@ V2 = asc_bus  +  β_cost * (wtp_time_bus * Variable(:time_bus)   + wtp_access * 
 V3 = asc_air  +  β_cost * (wtp_time_air * Variable(:time_air)   + wtp_access * Variable(:access_air)  + Variable(:cost_air)  + wtp_no_frills * (Variable(:service_air) == 1)  + wtp_wifi * (Variable(:service_air) == 2)   + wtp_food * (Variable(:service_air) == 3))    
 V4 = asc_rail +  β_cost * (wtp_time_rail * Variable(:time_rail) + wtp_access * Variable(:access_rail) + Variable(:cost_rail) + wtp_no_frills * (Variable(:service_rail) == 1) + wtp_wifi * (Variable(:service_rail) == 2 ) + wtp_food * (Variable(:service_rail) == 3))    
 
-utilities = [V1,V2,V3,V4]
+# Define the alternatives: name => code used in the choice column
+alternatives = (car = 1, bus = 2, air = 3, rail = 4)
+
+utilities = (car = V1, bus = V2, air = V3, rail = V4)
 
 # Load availability data
-availability = [
-    df.av_car .== 1,
-    df.av_bus .== 1,
-    df.av_air .== 1,
-    df.av_rail .== 1
-]
+availability = (
+    car  = df.av_car .== 1,
+    bus  = df.av_bus .== 1,
+    air  = df.av_air .== 1,
+    rail = df.av_rail .== 1
+)
 
 # Create model and estimate
-model = LogitModel(utilities; data=df, availability=availability)
+model = LogitModel(alternatives; utilities=utilities, availability=availability, data=df)
 results = estimate(model, :choice)
 
 # Output results

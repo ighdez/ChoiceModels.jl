@@ -71,8 +71,9 @@ end
         V2 = b_x * Variable(:x2) + b_y * Variable(:y2)
 
         R = 40
-        model = MixedLogitModel([V1, V2]; data=df, idvar=:ID,
+        model = MixedLogitModel([1, 2]; utilities=[V1, V2],
                                 availability=[trues(N), trues(N)],
+                                data=df, idvar=:ID,
                                 R=R, draw_scheme=:halton)
 
         params = Dict(:mu_x => 2.0, :sigma_x => 0.5, :mu_y => -0.5, :sigma_y => 0.3)
@@ -107,8 +108,8 @@ end
 
         R = 5
         avail = [trues(N), [i != 1 for i in 1:N]]   # alt 2 unavailable for obs 1
-        model = MixedLogitModel([V1, V2]; data=df, idvar=:ID,
-                                availability=avail, R=R, draw_scheme=:normal)
+        model = MixedLogitModel([1, 2]; utilities=[V1, V2], availability=avail,
+                                data=df, idvar=:ID, R=R, draw_scheme=:normal)
 
         params = Dict(:mu => -1.0, :sigma => 0.5)
         probs = ChoiceModels.logit_prob(model.utilities, df, params, avail, model.draws)
@@ -152,8 +153,9 @@ end
         V1 = asc + b * Variable(:x1)
         V2 = b * Variable(:x2)
 
-        model = MixedLogitModel([V1, V2]; data=df, idvar=:ID,
+        model = MixedLogitModel([1, 2]; utilities=[V1, V2],
                                 availability=[trues(N), trues(N)],
+                                data=df, idvar=:ID,
                                 R=100, draw_scheme=:halton)
 
         results = estimate(model, :choice; verbose=false)

@@ -33,18 +33,22 @@ b_ch_2     = Parameter(:b_ch_2, value=-0.5)
 V1_1 = asc_1 + b_tt_1 * Variable(:tt1) + b_tc_1 * Variable(:tc1) + b_hw_1 * Variable(:hw1) + b_ch_1 * Variable(:ch1)
 V2_1 = asc_2 + b_tt_1 * Variable(:tt2) + b_tc_1 * Variable(:tc2) + b_hw_1 * Variable(:hw2) + b_ch_1 * Variable(:ch2)
 
-utilities_1 = [V1_1, V2_1]
+utilities_1 = (route1 = V1_1, route2 = V2_1)
 
 V1_2 = asc_1 + b_tt_2 * Variable(:tt1) + b_tc_2 * Variable(:tc1) + b_hw_2 * Variable(:hw1) + b_ch_2 * Variable(:ch1)
 V2_2 = asc_2 + b_tt_2 * Variable(:tt2) + b_tc_2 * Variable(:tc2) + b_hw_2 * Variable(:hw2) + b_ch_2 * Variable(:ch2)
 
-utilities_2 = [V1_2, V2_2]
+utilities_2 = (route1 = V1_2, route2 = V2_2)
+
+# Define the alternatives: name => code used in the choice column. Bound once and
+# passed to both classes, so the latent class model inherits it from them.
+alternatives = (route1 = 1, route2 = 2)
 
 # Availability (assumed all available for simplicity)
-availability = [
-    trues(nrow(df)),
-    trues(nrow(df))
-]
+availability = (
+    route1 = trues(nrow(df)),
+    route2 = trues(nrow(df))
+)
 
 # Define Class parameters
 delta_1 = Parameter(:delta_1, value = 0)
@@ -54,8 +58,8 @@ prob_1 = exp(delta_1) / (exp(delta_1) + exp(delta_2))
 prob_2 = exp(delta_2) / (exp(delta_1) + exp(delta_2))
 
 # Create conditional probabilities
-model_1 = LogitModel(utilities_1; data=df, availability=availability)
-model_2 = LogitModel(utilities_2; data=df, availability=availability)
+model_1 = LogitModel(alternatives; utilities=utilities_1, availability=availability, data=df)
+model_2 = LogitModel(alternatives; utilities=utilities_2, availability=availability, data=df)
 
 # Create unconditional probability
 prob_indiv = prob_1 * model_1 + prob_2 * model_2

@@ -6,19 +6,22 @@ Structure for a Mixed Logit model, allowing for random taste variation.
 Combines symbolic utility expressions (fixed and random parameters) with data and simulation draws.
 
 # Fields
-- `utilities::Vector{DCMExpression}`: utility expressions per alternative
+- `alternatives::NamedTuple`: alternative name => code in the choice column; defines
+  the alternative set and the canonical order of every other per-alternative field
+- `utilities::Vector{DCMExpression}`: utility expressions, in `alternatives` order
+- `availability::Vector{Vector{Bool}}`: availability flags, in `alternatives` order
 - `data::DataFrame`: dataset with individual choice observations
 - `id::Tuple{Dict, Vector}`: mapping from observation ID to panel structure
-- `availability::Vector{Vector{Bool}}`: alternative availability flags per observation
 - `parameters::Dict{Symbol, Float64}`: dictionary of parameter values (means, std devs, etc.)
 - `draws::Dict{Symbol, Matrix{Float64}}`: simulation draws (size: `N × R`)
 - `R::Int`: number of draws per individual
 """
 struct MixedLogitModel <: DiscreteChoiceModel
+    alternatives::NamedTuple                        # Alternative name => choice-column code
     utilities::Vector{DCMExpression}                # Utility expressions V_j
+    availability::Vector{Vector{Bool}}              # Alternative availability
     data::DataFrame                                 # Dataset
     id::Tuple{Dict,Vector}                          # ID
-    availability::Vector{Vector{Bool}}              # Alternative availability
     parameters::Dict                                # Initial parameter values (mu, sigma, etc.)
     draws::Dict                                     # Draws: N x R
     R::Int                                          # Number of simulations (draws)
@@ -30,26 +33,36 @@ Constructs a `MixedLogitModel` from symbolic utility expressions and model input
 Automatically generates draws for all random parameters using the specified scheme.
 
 # Arguments
-- `utilities`: vector of symbolic utility expressions
+- `alternatives`: the alternative set, as a NamedTuple mapping each alternative's name
+  to the code identifying it in the choice column — `(car = 1, bus = 4, rail = 7)`. A
+  plain vector of codes is accepted for unnamed alternatives (labelled `alt1, alt2, …`)
+- `utilities`: utility expressions, keyed by the same names as `alternatives` (matched
+  by name, so their order is irrelevant)
+- `availability`: availability vectors, likewise keyed by name
 - `data`: DataFrame with observations
-- `availability`: list of availability vectors
+- `idvar`: column identifying the individual (panel structure and draw assignment)
 - `parameters`: dictionary with initial values (including means/sigmas)
 - `R`: number of draws per individual
 - `draw_scheme`: symbol indicating sampling method (`:normal`, `:uniform`, `:mlhs`, etc.)
-- `id`: optional vector of individual IDs (for panel structure)
 
 # Returns
 - `MixedLogitModel` instance with utility functions and simulation-ready data
 """
 function MixedLogitModel(
-    utilities::Vector{<:DCMExpression};
+    alternatives;
+    utilities,
+    availability = [],
     data::DataFrame,
     idvar::Symbol,
-    availability::Vector{<:AbstractVector{Bool}} = [],
     parameters::Dict = Dict(),
     draw_scheme::Symbol = :normal,
     R::Int = 100
 )
+
+    alts, named = _resolve_alternatives(alternatives)
+    utils = _check_utilities(_match_alternatives(alts, named, utilities, "utilities"))
+    avail = isempty(availability) ? AbstractVector{Bool}[] :
+            _check_availability(_match_alternatives(alts, named, availability, "availability"), data)
 
     # Get id variable
     id = data[:,idvar]
@@ -58,7 +71,7 @@ function MixedLogitModel(
     @assert issorted(id) "The vector `id` must be sorted to ensure consistent draw assignment."
 
     # 1. Collect all Draw objects in the utility expressions
-    draw_symbols = collect_draws(utilities)
+    draw_symbols = collect_draws(utils)
 
     # 2. : Identify unique individuals
     individuals = unique(id)
@@ -82,10 +95,11 @@ function MixedLogitModel(
 
     # 5. Build and return the model
     return MixedLogitModel(
-        utilities,
+        alts,
+        utils,
+        avail,
         data,
         (id_index_map, id),
-        availability,
         parameters,
         expanded_draws,
         R
@@ -283,11 +297,9 @@ function estimate(model::MixedLogitModel, choicevar::Symbol; verbose::Bool = tru
     
     choice_data = model.data[:,choicevar]
 
-    if any(ismissing, choice_data)
-        error("Choice vector contains missing values. Please clean your data.")
-    end
-
-    choices = Int.(choice_data)
+    # Translate the analyst's alternative codes into positions in `model.alternatives`
+    # once, here; the Y tensor and the probability tensor are both ordered by position.
+    choices = _recode_choices(choice_data, model.alternatives, choicevar)
 
     # Construct Y tensor (one-hot encoding) from cs_availability
     J = length(model.utilities)

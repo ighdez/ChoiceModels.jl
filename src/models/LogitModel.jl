@@ -9,41 +9,58 @@ using DataFrames
 """
 Data structure for multinomial logit models.
 
-Encapsulates symbolic utility functions, data, parameters, and availability constraints
-used in estimation and prediction.
+Encapsulates the alternative set, symbolic utility functions, data, parameters
+and availability constraints used in estimation and prediction.
 
 # Fields
-- `utilities::Vector{<:DCMExpression}`: utility expressions (one per alternative)
+- `alternatives::NamedTuple`: alternative name => code in the choice column; defines
+  the alternative set and the canonical order of every other per-alternative field
+- `utilities::Vector{<:DCMExpression}`: utility expressions, in `alternatives` order
+- `availability::Vector{<:AbstractVector{Bool}}`: availability vectors, in `alternatives` order
 - `data::DataFrame`: input dataset
 - `parameters::Dict`: parameter values (estimates or fixed)
-- `availability::Vector{Vector{Bool}}`: list of availability vectors per alternative (optional)
 """
 struct LogitModel <: DiscreteChoiceModel
+    alternatives::NamedTuple
     utilities::Vector{<:DCMExpression}
+    availability::Vector{<:AbstractVector{Bool}}
     data::DataFrame
     parameters::Dict
-    availability::Vector{<:AbstractVector{Bool}}
 end
 
 """
 Constructor for `LogitModel`.
 
 # Arguments
-- `utilities`: vector of symbolic utility expressions
+- `alternatives`: the alternative set, as a NamedTuple mapping each alternative's
+  name to the code identifying it in the choice column — `(car = 1, bus = 4, rail = 7)`.
+  A plain vector of codes (`[1, 4, 7]`) is accepted for unnamed alternatives, which
+  are then labelled `alt1, alt2, …`
+- `utilities`: utility expressions, as a NamedTuple over the same names as
+  `alternatives` (their order is irrelevant — they are matched by name)
+- `availability`: boolean vectors marking which alternatives are available, likewise
+  keyed by name (default: empty, meaning no availability restrictions are applied)
 - `data`: `DataFrame` with explanatory variables
 - `parameters`: initial/fixed values for model parameters (default: empty `Dict()`)
-- `availability`: list of boolean vectors indicating which alternatives are available (default: all available)
 
 # Returns
 - A `LogitModel` instance
 """
 function LogitModel(
-    utilities::Vector{<:DCMExpression};
+    alternatives;
+    utilities,
+    availability = [],
     data::DataFrame,
-    parameters::Dict = Dict(),
-    availability::Vector{<:AbstractVector{Bool}} = []
+    parameters::Dict = Dict()
 )
-    return LogitModel(utilities, data, parameters, availability)
+    alts, named = _resolve_alternatives(alternatives)
+    utils = _check_utilities(_match_alternatives(alts, named, utilities, "utilities"))
+    # An empty `availability` is the "no restrictions" default rather than a
+    # mismatch against the alternatives, so it skips the matching entirely.
+    avail = isempty(availability) ? AbstractVector{Bool}[] :
+            _check_availability(_match_alternatives(alts, named, availability, "availability"), data)
+
+    return LogitModel(alts, utils, avail, data, parameters)
 end
 
 """
@@ -222,12 +239,10 @@ function estimate(
 
     choice_data = model.data[:,choicevar]
 
-    if any(ismissing, choice_data)
-        error("Choice vector contains missing values. Please clean your data.")
-    end
+    # Translate the analyst's alternative codes into positions in `model.alternatives`
+    # once, here; everything downstream indexes the probability matrix by position.
+    choices = _recode_choices(choice_data, model.alternatives, choicevar)
 
-    choices = Int.(choice_data)
-    
     params = collect_parameters(model.utilities)
     param_names = [p.name for p in params]
     init_values = Dict(p.name => p.value for p in params)

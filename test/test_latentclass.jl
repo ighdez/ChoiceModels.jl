@@ -49,10 +49,11 @@ end
     delta_1 = Parameter(:delta_1, value=0.4)
     delta_2 = Parameter(:delta_2, value=0.0, fixed=true)
 
-    m1 = LogitModel([b1 * Variable(:x1) + a1, b1 * Variable(:x2), b1 * Variable(:x3)];
-                    data=df, availability=avail)
-    m2 = LogitModel([b2 * Variable(:x1) + a2, b2 * Variable(:x2), b2 * Variable(:x3)];
-                    data=df, availability=avail)
+    alts = [1, 2, 3]
+    m1 = LogitModel(alts; utilities=[b1 * Variable(:x1) + a1, b1 * Variable(:x2), b1 * Variable(:x3)],
+                    availability=avail, data=df)
+    m2 = LogitModel(alts; utilities=[b2 * Variable(:x1) + a2, b2 * Variable(:x2), b2 * Variable(:x3)],
+                    availability=avail, data=df)
 
     π1 = exp(delta_1) / (exp(delta_1) + exp(delta_2))
     π2 = exp(delta_2) / (exp(delta_1) + exp(delta_2))
@@ -114,7 +115,7 @@ end
         model = LatentClassModel(lc_expr; data=df, idvar=:ID)
         lc_ll = sum(loglikelihood(model, Y; parameters=same))
 
-        mnl = LogitModel([b1 * Variable(:x1) + a1, b1 * Variable(:x2), b1 * Variable(:x3)];
+        mnl = LogitModel(alts; utilities=[b1 * Variable(:x1) + a1, b1 * Variable(:x2), b1 * Variable(:x3)],
                          data=df, availability=avail)
         mnl_ll = sum(loglikelihood(mnl, df.choice; parameters=same))
 
@@ -133,9 +134,9 @@ end
         z_a1, z_a2 = Parameter(:a1, value=0.0), Parameter(:a2, value=0.0)
         z_d1 = Parameter(:delta_1, value=0.0)
         z_d2 = Parameter(:delta_2, value=0.0, fixed=true)
-        z_m1 = LogitModel([z_b1 * Variable(:x1) + z_a1, z_b1 * Variable(:x2), z_b1 * Variable(:x3)];
+        z_m1 = LogitModel(alts; utilities=[z_b1 * Variable(:x1) + z_a1, z_b1 * Variable(:x2), z_b1 * Variable(:x3)],
                           data=df, availability=avail)
-        z_m2 = LogitModel([z_b2 * Variable(:x1) + z_a2, z_b2 * Variable(:x2), z_b2 * Variable(:x3)];
+        z_m2 = LogitModel(alts; utilities=[z_b2 * Variable(:x1) + z_a2, z_b2 * Variable(:x2), z_b2 * Variable(:x3)],
                           data=df, availability=avail)
         z_expr = (exp(z_d1) / (exp(z_d1) + exp(z_d2))) * z_m1 +
                  (exp(z_d2) / (exp(z_d1) + exp(z_d2))) * z_m2
@@ -157,9 +158,9 @@ end
         # classes share every parameter value but the parameters enter different
         # utilities, so the classes are genuinely distinct and must NOT be flagged.
         s_b = Parameter(:sb, value=0.5)
-        s_m1 = LogitModel([s_b * Variable(:x1), s_b * Variable(:x2), s_b * Variable(:x3)];
+        s_m1 = LogitModel(alts; utilities=[s_b * Variable(:x1), s_b * Variable(:x2), s_b * Variable(:x3)],
                           data=df, availability=avail)
-        s_m2 = LogitModel([s_b * Variable(:x2), s_b * Variable(:x1), s_b * Variable(:x3)];
+        s_m2 = LogitModel(alts; utilities=[s_b * Variable(:x2), s_b * Variable(:x1), s_b * Variable(:x3)],
                           data=df, availability=avail)
         s_expr = (exp(z_d1) / (exp(z_d1) + exp(z_d2))) * s_m1 +
                  (exp(z_d2) / (exp(z_d1) + exp(z_d2))) * s_m2
@@ -222,11 +223,16 @@ end
         # the panel likelihood needs cannot be recovered — must fail loudly, not
         # silently fall back to the per-observation mixture.
         odd_expr = π1 * m1 + b1
-        bad = LatentClassModel(odd_expr; data=df, idvar=:ID)
+
+        # Such an expression also has no class models to inherit the alternatives
+        # from, so it must be given them explicitly.
+        @test_throws ErrorException LatentClassModel(odd_expr; data=df, idvar=:ID)
+
+        bad = LatentClassModel(odd_expr; alternatives=alts, data=df, idvar=:ID)
         @test_throws ErrorException loglikelihood(bad, Y; parameters=params)
 
         # Without idvar the same expression is fine (cross-sectional path).
-        ok = LatentClassModel(odd_expr; data=df)
+        ok = LatentClassModel(odd_expr; alternatives=alts, data=df)
         @test length(loglikelihood(ok, Y; parameters=params)) == N
 
         # A single `weight * model` term IS decomposable (one-class model). Its

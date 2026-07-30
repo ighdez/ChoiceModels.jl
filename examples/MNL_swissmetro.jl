@@ -25,25 +25,28 @@ asc_sm = Parameter(:asc_sm, value=0, fixed=true)
 β_time = Parameter(:β_time, value=0)
 β_cost = Parameter(:β_cost, value=0)
 
-# Define utility functions
-V1 = asc_train + β_time * Variable(:TRAIN_TT) + β_cost * Variable(:TRAIN_CO)
-V2 = asc_sm    + β_time * Variable(:SM_TT)    + β_cost * Variable(:SM_CO)
-V3 = asc_car   + β_time * Variable(:CAR_TT)   + β_cost * Variable(:CAR_CO)
+# Define the alternatives: name => code used in the CHOICE column
+alternatives = (train = 1, sm = 2, car = 3)
 
-utilities = [V1,V2,V3]
+# Define utility functions
+utilities = (
+    train = asc_train + β_time * Variable(:TRAIN_TT) + β_cost * Variable(:TRAIN_CO),
+    sm    = asc_sm    + β_time * Variable(:SM_TT)    + β_cost * Variable(:SM_CO),
+    car   = asc_car   + β_time * Variable(:CAR_TT)   + β_cost * Variable(:CAR_CO)
+)
 
 # Load availability data
 df.TRAIN_AV_SP .= ifelse.(df.SP .!= 0, df.TRAIN_AV, 0)
 df.CAR_AV_SP .= ifelse.(df.SP .!= 0, df.CAR_AV, 0)
 
-availability = [
-    df.TRAIN_AV_SP .== 1,
-    df.SM_AV .== 1,
-    df.CAR_AV_SP .== 1
-]
+availability = (
+    train = df.TRAIN_AV_SP .== 1,
+    sm    = df.SM_AV .== 1,
+    car   = df.CAR_AV_SP .== 1
+)
 
 # Create model and estimate
-model = LogitModel(utilities; data=df, availability=availability)
+model = LogitModel(alternatives; utilities=utilities, availability=availability, data=df)
 results = estimate(model, :CHOICE)
 
 # Output results

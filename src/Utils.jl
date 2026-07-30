@@ -94,6 +94,269 @@ function collect_draws(utilities::Vector{<:DCMExpression})
 end
 
 # ---------------------------------------------------------------------------
+# Alternatives: names, codes, and the observed choice column
+#
+# Every model stores its alternative set as a NamedTuple mapping a name to the
+# code that identifies that alternative in the data's choice column —
+# `(car = 1, bus = 4, rail = 7)`. That NamedTuple is the single source of truth
+# for (a) which alternatives exist, (b) their canonical order, and (c) how the
+# observed choice column maps onto positions in the probability matrix.
+#
+# `utilities` and `availability` are matched to it BY NAME and stored as plain
+# vectors in the NamedTuple's key order, so the likelihood keeps indexing by
+# position and nothing in the hot loop ever touches the NamedTuple. Its keys
+# live in its *type*, which is why the struct field is abstractly typed; that
+# costs nothing as long as it stays construction/reporting metadata. Do not
+# read it inside `logit_prob` or `loglikelihood`.
+# ---------------------------------------------------------------------------
+
+"""
+Normalizes the user's `alternatives` argument into a canonical NamedTuple of
+`name => code` pairs.
+
+Two accepted forms:
+
+- `NamedTuple` — `(car = 1, bus = 4, rail = 7)`: names chosen by the analyst,
+  codes as they appear in the choice column. `utilities` and `availability`
+  must then be NamedTuples over the same names.
+- `AbstractVector{<:Integer}` — `[1, 4, 7]`: the codes alone, for alternative
+  sets built programmatically where literal NamedTuple syntax is impractical.
+  Names are generated as `:alt1, :alt2, …` (Apollo's convention for unnamed
+  alternatives), and `utilities`/`availability` are then positional vectors.
+
+# Returns
+- `(alternatives::NamedTuple, named::Bool)` — `named` records which form was
+  used, so the matching of `utilities`/`availability` can insist on the same one
+  (mixing a NamedTuple with a positional vector is exactly the ambiguity this
+  API exists to remove).
+"""
+function _resolve_alternatives(alternatives::NamedTuple)
+    isempty(alternatives) && error("`alternatives` is empty: a model needs at least one alternative.")
+
+    labels = collect(keys(alternatives))
+    values_ = collect(values(alternatives))
+
+    bad = findall(v -> !(v isa Integer), values_)
+    if !isempty(bad)
+        error("""
+              `alternatives` must map each alternative name to the integer code identifying it \
+              in the choice column, but $(join(string.(labels[bad]), ", ")) \
+              $(length(bad) == 1 ? "is" : "are") not integer-valued \
+              (got $(join(repr.(values_[bad]), ", "))).
+              """)
+    end
+
+    codes = Int.(values_)
+    _check_duplicate_codes(codes, labels)
+
+    return NamedTuple{Tuple(labels)}(Tuple(codes)), true
+end
+
+function _resolve_alternatives(alternatives::AbstractVector{<:Integer})
+    isempty(alternatives) && error("`alternatives` is empty: a model needs at least one alternative.")
+
+    codes = Int.(alternatives)
+    labels = [Symbol("alt", j) for j in 1:length(codes)]
+    _check_duplicate_codes(codes, labels)
+
+    return NamedTuple{Tuple(labels)}(Tuple(codes)), false
+end
+
+_resolve_alternatives(alternatives) = error("""
+    `alternatives` must be a NamedTuple mapping alternative names to the codes used in the \
+    choice column — e.g. `alternatives = (car = 1, bus = 4, rail = 7)` — or a vector of those \
+    codes for unnamed alternatives. Got a $(typeof(alternatives)).
+    """)
+
+function _check_duplicate_codes(codes::Vector{Int}, labels::Vector{Symbol})
+    for j in 1:length(codes), k in (j + 1):length(codes)
+        if codes[j] == codes[k]
+            error("""
+                  Alternatives $(labels[j]) and $(labels[k]) share the code $(codes[j]) in \
+                  `alternatives`. Each alternative needs its own code, since the code is what \
+                  identifies it in the choice column.
+                  """)
+        end
+    end
+    return nothing
+end
+
+# "car => 1, bus => 4, rail => 7", for error messages.
+_alternatives_str(alternatives::NamedTuple) =
+    join(("$k => $v" for (k, v) in pairs(alternatives)), ", ")
+
+"""
+Matches a `utilities` or `availability` argument against the model's
+`alternatives` and returns it as a plain `Vector` in the alternatives' order.
+
+With named alternatives the argument must be a NamedTuple over exactly the same
+names; its own order is irrelevant and is discarded here. With unnamed
+alternatives it must be a vector of the right length. Anything else throws,
+naming the alternatives responsible.
+
+# Arguments
+- `alternatives::NamedTuple`: canonical alternative set (from `_resolve_alternatives`)
+- `named::Bool`: whether the user supplied named alternatives
+- `x`: the `utilities` or `availability` argument
+- `what::AbstractString`: which one, used in the messages
+"""
+function _match_alternatives(alternatives::NamedTuple, named::Bool, x::NamedTuple, what::AbstractString)
+    if !named
+        error("""
+              `$what` was given as a NamedTuple, but `alternatives` was given as a plain vector \
+              of codes, so the alternatives have no names to match it against. Either name the \
+              alternatives — `alternatives = (car = 1, bus = 4, …)` — or pass `$what` as a \
+              vector in the same order as `alternatives`.
+              """)
+    end
+
+    want = collect(keys(alternatives))
+    got = collect(keys(x))
+
+    missing_ = setdiff(want, got)
+    extra = setdiff(got, want)
+    if !isempty(missing_) || !isempty(extra)
+        problems = String[]
+        isempty(missing_) || push!(problems, "`$what` is missing $(join(string.(missing_), ", "))")
+        isempty(extra) || push!(problems,
+            "`$what` has $(join(string.(extra), ", ")), which $(length(extra) == 1 ? "is" : "are") not in `alternatives`")
+        error("""
+              `$what` does not cover the same alternatives as `alternatives`: $(join(problems, "; ")).
+              Declared alternatives: $(_alternatives_str(alternatives)).
+              """)
+    end
+
+    return [x[k] for k in want]
+end
+
+function _match_alternatives(alternatives::NamedTuple, named::Bool, x::AbstractVector, what::AbstractString)
+    if named
+        error("""
+              `alternatives` names its alternatives ($(join(string.(keys(alternatives)), ", "))), \
+              so `$what` must be a NamedTuple over the same names — e.g. \
+              `$what = ($(first(keys(alternatives))) = …, …)` — rather than a positional vector. \
+              Matching by name is what makes the order irrelevant.
+              """)
+    end
+
+    if length(x) != length(alternatives)
+        error("""
+              `$what` has $(length(x)) entries but there are $(length(alternatives)) alternatives \
+              ($(_alternatives_str(alternatives))). With unnamed alternatives the two are matched \
+              by position, so they must have the same length.
+              """)
+    end
+
+    return collect(x)
+end
+
+_match_alternatives(alternatives::NamedTuple, named::Bool, x, what::AbstractString) = error("""
+    `$what` must be $(named ? "a NamedTuple over the alternative names ($(join(string.(keys(alternatives)), ", ")))" :
+                              "a vector with one entry per alternative"), \
+    but got a $(typeof(x)).
+    """)
+
+"""
+Checks that every entry matched out of `utilities` is a symbolic expression, so a
+mistyped entry is reported by name rather than as a `MethodError` from the struct
+constructor. Preserves a concrete element type when there is one — `logit_prob`
+specializes on it.
+"""
+function _check_utilities(utils::AbstractVector)
+    bad = findall(u -> !(u isa DCMExpression), utils)
+    if !isempty(bad)
+        error("""
+              `utilities` entries $(join(string.(bad), ", ")) are not symbolic expressions \
+              (got $(join(string.(typeof.(utils[bad])), ", "))). Build each utility from \
+              `Parameter`, `Variable` and `Draw` terms.
+              """)
+    end
+    return eltype(utils) <: DCMExpression ? utils : convert(Vector{DCMExpression}, utils)
+end
+
+"""
+Checks the availability vectors: boolean, and one entry per row of `data`.
+"""
+function _check_availability(avail::AbstractVector, data::DataFrame)
+    bad = findall(a -> !(a isa AbstractVector{Bool}), avail)
+    if !isempty(bad)
+        error("""
+              `availability` entries $(join(string.(bad), ", ")) are not boolean vectors \
+              (got $(join(string.(typeof.(avail[bad])), ", "))). Each entry must be a vector of \
+              `Bool` with one element per observation — e.g. `df.av_car .== 1`.
+              """)
+    end
+
+    N = nrow(data)
+    wrong = findall(a -> length(a) != N, avail)
+    if !isempty(wrong)
+        error("""
+              `availability` entries $(join(string.(wrong), ", ")) have \
+              $(join(string.(length.(avail[wrong])), ", ")) elements, but `data` has $N rows. \
+              Availability is recorded per observation.
+              """)
+    end
+
+    return eltype(avail) <: AbstractVector{Bool} ? avail : convert(Vector{AbstractVector{Bool}}, avail)
+end
+
+"""
+Recodes an observed choice column into **positions** in the model's alternative
+ordering.
+
+The utilities, the availability vectors and every probability matrix are ordered
+by `alternatives`, and the likelihood indexes them directly (`probs[n, j]`), so
+the choice column has to be translated from the analyst's codes to positions
+exactly once — here, at the top of `estimate` — rather than being assumed to
+already be `1:J` in the right order.
+
+Errors on a missing value, and on any code no alternative claims (which would
+otherwise be either a `BoundsError` deep in the likelihood or, worse, a silently
+wrong model in which the code maps onto some other alternative).
+
+# Arguments
+- `choice_data`: the raw choice column
+- `alternatives::NamedTuple`: the model's alternatives
+- `choicevar::Symbol`: its column name, used in the messages
+
+# Returns
+- `Vector{Int}`: position in `1:J` of the alternative chosen in each row
+"""
+function _recode_choices(choice_data, alternatives::NamedTuple, choicevar::Symbol)
+    if any(ismissing, choice_data)
+        error("Choice vector contains missing values. Please clean your data.")
+    end
+
+    codes = collect(Int, values(alternatives))
+    lookup = Dict(c => j for (j, c) in enumerate(codes))
+
+    raw = try
+        Int.(choice_data)
+    catch
+        error("""
+              Choice column `$choicevar` is not integer-valued, so it cannot be matched against \
+              the alternative codes ($(_alternatives_str(alternatives))).
+              """)
+    end
+
+    positions = Vector{Int}(undef, length(raw))
+    @inbounds for n in 1:length(raw)
+        j = get(lookup, raw[n], 0)
+        if j == 0
+            error("""
+                  Choice column `$choicevar` contains the value $(raw[n]) (row $n), which is not \
+                  the code of any alternative. Declared alternatives: \
+                  $(_alternatives_str(alternatives)).
+                  Either add the missing alternative to `alternatives`, or correct the data.
+                  """)
+        end
+        positions[n] = j
+    end
+
+    return positions
+end
+
+# ---------------------------------------------------------------------------
 # Shared standard-error machinery
 #
 # All three `estimate` functions used to inline the same guarded `sqrt.(diag(V))`

@@ -19,24 +19,27 @@ asc_rail = Parameter(:asc_rail, value=0)
 β_access = Parameter(:β_access, value=0)
 β_cost = Parameter(:β_cost, value=0)
 
-# Define utility functions
-V1 = asc_car  + β_time_car * Variable(:time_car) + β_cost * Variable(:cost_car)
-V2 = asc_bus  + β_time_bus * Variable(:time_bus)   + β_access * Variable(:access_bus)  + β_cost * Variable(:cost_bus)
-V3 = asc_air  + β_time_air * Variable(:time_air)   + β_access * Variable(:access_air)  + β_cost * Variable(:cost_air)
-V4 = asc_rail + β_time_rail * Variable(:time_rail) + β_access * Variable(:access_rail) + β_cost * Variable(:cost_rail)
+# Define the alternatives: name => code used in the choice column
+alternatives = (car = 1, bus = 2, air = 3, rail = 4)
 
-utilities = [V1,V2,V3,V4]
+# Define utility functions
+utilities = (
+    car  = asc_car  + β_time_car  * Variable(:time_car)                                            + β_cost * Variable(:cost_car),
+    bus  = asc_bus  + β_time_bus  * Variable(:time_bus)  + β_access * Variable(:access_bus)  + β_cost * Variable(:cost_bus),
+    air  = asc_air  + β_time_air  * Variable(:time_air)  + β_access * Variable(:access_air)  + β_cost * Variable(:cost_air),
+    rail = asc_rail + β_time_rail * Variable(:time_rail) + β_access * Variable(:access_rail) + β_cost * Variable(:cost_rail)
+)
 
 # Load availability data
-availability = [
-    df.av_car .== 1,
-    df.av_bus .== 1,
-    df.av_air .== 1,
-    df.av_rail .== 1
-]
+availability = (
+    car  = df.av_car .== 1,
+    bus  = df.av_bus .== 1,
+    air  = df.av_air .== 1,
+    rail = df.av_rail .== 1
+)
 
 # Create model and estimate
-model = LogitModel(utilities; data=df, availability=availability)
+model = LogitModel(alternatives; utilities=utilities, availability=availability, data=df)
 results = estimate(model, :choice)
 
 # Output results

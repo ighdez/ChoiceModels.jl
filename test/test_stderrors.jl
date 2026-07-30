@@ -305,8 +305,8 @@ end
         asc1 = Parameter(:asc1, value=0.0)
         asc2 = Parameter(:asc2, value=0.0)
         b    = Parameter(:b,    value=0.0)
-        model = LogitModel([asc1 + b * Variable(:x1), asc2 + b * Variable(:x2)];
-                           data=df, availability=[trues(N), trues(N)])
+        model = LogitModel([1, 2]; utilities=[asc1 + b * Variable(:x1), asc2 + b * Variable(:x2)],
+                           availability=[trues(N), trues(N)], data=df)
 
         results = @test_logs (:warn,) match_mode=:any estimate(model, :CHOICE; verbose=false)
         @test results.converged
@@ -328,8 +328,8 @@ end
         # The identified counterpart must NOT warn, so the check isn't just noisy.
         asc = Parameter(:asc, value=0.0)
         b2  = Parameter(:b,   value=0.0)
-        ok = LogitModel([asc + b2 * Variable(:x1), b2 * Variable(:x2)];
-                        data=df, availability=[trues(N), trues(N)])
+        ok = LogitModel([1, 2]; utilities=[asc + b2 * Variable(:x1), b2 * Variable(:x2)],
+                        availability=[trues(N), trues(N)], data=df)
         r_ok = estimate(ok, :CHOICE; verbose=false)
         @test r_ok.hessian === :posdef
         @test all(isfinite, values(r_ok.std_errors))
@@ -351,8 +351,8 @@ end
         asc = Parameter(:asc, value=0.0)
         β = Parameter(:β, value=0.0)
 
-        model = LogitModel([asc + β * Variable(:x1), β * Variable(:x2)];
-                           data=df, availability=[trues(N), trues(N)])
+        model = LogitModel([1, 2]; utilities=[asc + β * Variable(:x1), β * Variable(:x2)],
+                           availability=[trues(N), trues(N)], data=df)
         results = estimate(model, :CHOICE; verbose=false)
 
         @test results.hessian === :posdef

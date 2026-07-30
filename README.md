@@ -29,7 +29,13 @@ asc_car = Parameter(:asc_car, value=0.0)
 V_car = asc_car + β_time * Variable(:time_car) + β_cost * Variable(:cost_car)
 V_bus = β_time * Variable(:time_bus) + β_cost * Variable(:cost_bus)
 
-model = LogitModel([V_car, V_bus]; data=df, availability=[trues(nrow(df)), trues(nrow(df))])
+# `alternatives` maps each alternative's name to the code it carries in the choice
+# column; `utilities` and `availability` are matched to it by name, so their order
+# does not matter.
+model = LogitModel((car = 1, bus = 2);
+    utilities    = (car = V_car, bus = V_bus),
+    availability = (car = trues(nrow(df)), bus = trues(nrow(df))),
+    data         = df)
 results = estimate(model, :choice)
 probs = predict(model, results)
 ```
@@ -51,12 +57,13 @@ draw = Draw(:time_rnd)
 V_car = asc_car + (β_time + σ_time * draw) * Variable(:time_car)
 V_bus = (β_time + σ_time * draw) * Variable(:time_bus)
 
-model = MixedLogitModel([V_car, V_bus];
-    data=df,
-    idvar=:id,
-    R=500,
-    draw_scheme=:mlhs,
-    availability=[trues(nrow(df)), trues(nrow(df))])
+model = MixedLogitModel((car = 1, bus = 2);
+    utilities    = (car = V_car, bus = V_bus),
+    availability = (car = trues(nrow(df)), bus = trues(nrow(df))),
+    data         = df,
+    idvar        = :id,
+    R            = 500,
+    draw_scheme  = :mlhs)
 
 results = estimate(model, :choice)
 P = predict(model, results)
@@ -99,4 +106,4 @@ MIT License
 - [Apollo](https://www.apollochoicemodelling.com/)
 - [Discrete Choice Methods with Simulation](https://eml.berkeley.edu/books/choice2.html)
 
-Built with ♥ and `ChatGPT` pair-programming.
+Built with ♥ and `ChatGPT` + `Claude Code` pair-programming.
