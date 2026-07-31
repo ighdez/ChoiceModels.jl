@@ -188,4 +188,78 @@ end
         @test all(abs.(sum(preds, dims=2) .- 1.0) .< 1e-10)
     end
 
+    # An individual's contribution is the probability of their whole choice
+    # SEQUENCE, a product over their observations, so it falls off exponentially
+    # in the panel length. The simulated likelihood therefore has to average over
+    # draws in LOGS. The original code materialized `exp.(log_indiv)` and averaged
+    # that, so once the sequence probability dropped below the `max(·, 1e-30)`
+    # failsafe every individual pinned to log(1e-30) = -69.08 regardless of the
+    # parameters — a plausible-looking number, silently independent of the data.
+    #
+    # Measured on this fixture before the fix: correct at 10 observations per
+    # individual, but -138.1551 (= 2 × the floor) at 200, 600 AND 1200, where the
+    # true values are -280.56 / -836.19 / -1668.50. The threshold is
+    # `T·|log p| > 69`, i.e. roughly 150-250 observations per individual — well
+    # inside real panel data, and far below the ~745 at which Float64 itself
+    # underflows. Same failure mode as the softmax-underflow bug: a failsafe
+    # converting an underflow into a number rather than an error.
+    #
+    # The reference is the LatentClassModel panel path, which has always worked in
+    # logs. It is an independent implementation, not a rearrangement of this one.
+    @testset "long panels do not hit the probability floor" begin
+        floor_ll = log(1e-30)   # what a clamped contribution would report
+
+        for T_obs in (10, 200, 600)
+            Random.seed!(3)
+            I_ind = 2
+            ids = repeat(1:I_ind, inner=T_obs)
+            N_obs = length(ids)
+            df_lp = DataFrame(ID=ids, x1=randn(N_obs), x2=randn(N_obs),
+                              choice=rand(1:2, N_obs))
+            Y2 = zeros(Bool, N_obs, 2)
+            Y3 = zeros(Bool, N_obs, 2, 6)
+            for n in 1:N_obs
+                Y2[n, df_lp.choice[n]] = true
+                Y3[n, df_lp.choice[n], :] .= true
+            end
+
+            alts_lp = (a=1, b=2)
+            mu_lp = Parameter(:mu_lp, value=-0.3)
+            sg_lp = Parameter(:sg_lp, value=0.4)
+            utils = (a=(mu_lp + sg_lp*Draw(:z_lp)) * Variable(:x1),
+                     b=(mu_lp + sg_lp*Draw(:z_lp)) * Variable(:x2))
+            m_lp = MixedLogitModel(alts_lp; utilities=utils, data=df_lp,
+                                   idvar=:ID, R=6, draw_scheme=:halton)
+
+            # Compare against the latent-class panel path holding the SAME draws
+            # (the latent class regenerates them), at a single class of weight 1.
+            unit = Parameter(:unit_lp, value=1.0, fixed=true)
+            lc_lp = LatentClassModel(unit * m_lp; data=df_lp, idvar=:ID)
+            same_draws = ChoiceModels._lc_classes(lc_lp.expr)[1][2]
+
+            p = Dict(:mu_lp=>-0.3, :sg_lp=>0.4, :unit_lp=>1.0)
+            mxl_ll = loglikelihood(same_draws, Y3; parameters=p)
+            lc_ll  = loglikelihood(lc_lp, Y2; parameters=p)
+
+            @test sum(mxl_ll) ≈ sum(lc_ll)
+
+            # No contribution may be sitting exactly on the floor.
+            @test all(abs.(mxl_ll .- floor_ll) .> 1e-8)
+
+            if T_obs >= 200
+                # THE discriminating assertion. A long enough sequence has a
+                # probability genuinely below 1e-30, so its correct log-likelihood
+                # contribution is BELOW log(1e-30) — which clamping can never
+                # produce, since the clamp is a floor on the probability and
+                # therefore a floor on the contribution. Under the bug these came
+                # out at exactly -69.08 each, flat in T; here they must keep
+                # falling as the panel lengthens.
+                @test all(mxl_ll .< floor_ll)
+                @test sum(mxl_ll) < I_ind * floor_ll
+            else
+                @test all(mxl_ll .> floor_ll)   # short panel: nowhere near it
+            end
+        end
+    end
+
 end

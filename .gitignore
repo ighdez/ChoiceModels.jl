@@ -2,3 +2,12 @@
 CLAUDE.md
 .claude/
 .DS_Store
+
+# Exploration notebooks — scratch work, not part of the package or its examples
+*.ipynb
+.ipynb_checkpoints/
+
+# Reference implementations in R (Apollo). Kept on disk for validating against,
+# but not tracked; see the validation numbers recorded in CLAUDE.md.
+*.r
+*.R

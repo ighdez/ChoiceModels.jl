@@ -236,7 +236,6 @@ function loglikelihood(model::MixedLogitModel, Y::Array{Bool,3};parameters::Dict
 
     # Compute log-probabilities with failsafe
     log_indiv = zeros(T, I, R)
-    indiv_prob = Array{T}(undef, I, R)
     loglik = zeros(T, I)
     Threads.@threads for r in 1:R
         @inbounds begin
@@ -246,15 +245,40 @@ function loglikelihood(model::MixedLogitModel, Y::Array{Bool,3};parameters::Dict
                 i = id_map[id[n]]
                 log_indiv[i, r] += log_chosen[n, 1]  # extrae escalar
             end
-            indiv_prob[:, r] .= exp.(log_indiv[:, r])  # ← CORRECTO
         end
     end
 
-    # Final log-likelihood with failsafe
+    # Average the sequence probability over draws IN LOGS:
+    # log (1/R) Σ_r exp(Σ_t log P_t(r)).
+    #
+    # This used to materialize `exp.(log_indiv)` and average that, which is the
+    # same quantity in exact arithmetic and silently wrong in Float64. An
+    # individual's sequence probability is a product over their observations, so
+    # it falls off exponentially in the panel length: once it drops below the
+    # `1e-30` failsafe the contribution is CLAMPED, and every individual pins to
+    # log(1e-30) = -69.08 regardless of the parameters. Measured on a 2-individual
+    # fixture: correct at 10 observations each, but at 200/600/1200 the old code
+    # returned -138.1551 every time (= 2 × the floor) while the true values are
+    # -280.56 / -836.19 / -1668.50. The threshold is `T·|log p| > 69`, i.e. very
+    # roughly 150-250 observations per individual — well inside real panel data,
+    # and far below the ~745 where Float64 itself would underflow.
+    #
+    # Same failure mode as the softmax-underflow bug recorded in CLAUDE.md: a
+    # `max(·, 1e-30)` failsafe converting an underflow into a plausible-looking
+    # number instead of an error. The `LatentClassModel` panel path has always
+    # done this in logs; this brings the standalone model into line.
+    logR = log(T(R))
     Threads.@threads for i in 1:I
         @inbounds begin
-            avg_prob = sum(indiv_prob[i, :]) / R
-            loglik[i] = log(max(avg_prob, T(1e-30)))
+            mx = -T(Inf)
+            for r in 1:R
+                mx = max(mx, log_indiv[i, r])
+            end
+            s = zero(T)
+            for r in 1:R
+                s += exp(log_indiv[i, r] - mx)
+            end
+            loglik[i] = mx + log(s) - logR
         end
     end
 

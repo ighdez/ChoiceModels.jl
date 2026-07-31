@@ -63,7 +63,12 @@ availability = (
 # Create model and estimate
 using Random
 Random.seed!(12345)
-model = MixedLogitModel(alternatives; utilities=utilities, availability=availability, data=df, idvar=:ID, R=100, draw_scheme=:normal)
+# 500 Halton draws, not 100 pseudo-random normals. With four random parameters,
+# R=100 `:normal` gave a visibly noisy simulated likelihood: the optimizer landed
+# on a different local optimum under any perturbation (three starting points gave
+# −3612.3, −3641.0 and −3621.3), so the previously recorded log-likelihood was one
+# draw from a lottery rather than a reproducible number.
+model = MixedLogitModel(alternatives; utilities=utilities, availability=availability, data=df, idvar=:ID, R=500, draw_scheme=:halton)
 results = estimate(model, :CHOICE)
 
 # Output results
