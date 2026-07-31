@@ -148,18 +148,39 @@ function logit_prob(
     J = length(utilities)
 
     # Evaluated utilities: utils[j] is N × R
-    utils = Vector{Matrix{<:Real}}(undef, J)
+    raw = Vector{Any}(undef, J)
 
     Threads.@threads for j in 1:J
-        utils[j] = evaluate(utilities[j], data, parameters, draws)
+        raw[j] = evaluate(utilities[j], data, parameters, draws)
     end
 
-    N, R = size(utils[1])
+    # Narrow to a concrete element type and hand off through a FUNCTION BARRIER.
+    # The utilities' element type is only known at run time — it is whatever `Dual`
+    # the caller happens to be differentiating through — so the softmax kernel has
+    # to be reached via a separate call for Julia to specialize it. Held inline
+    # (the container used to be `Vector{Matrix{<:Real}}`, abstract) every `utils[j]`
+    # in the loop below went through dynamic dispatch.
+    return _mxl_softmax(identity.(raw), availability)
+end
 
-    # Initialize 3D tensor: (N, J, R)
+"""
+Stable softmax over the evaluated utilities: turns `J` matrices of size `N × R`
+into the `N × J × R` probability tensor.
+
+Split out of `logit_prob` as a function barrier (see the call site). Allocates two
+arrays — the tensor itself and an `N × R` normalizer — and nothing per draw: the
+column slices are views, the normalizer is accumulated in place, and the final
+division writes back into `expU` rather than into a second tensor. Under
+`ForwardDiff` every element is a nested `Dual`, so each avoided `N × J × R`
+temporary is hundreds of megabytes on a realistic model.
+"""
+function _mxl_softmax(utils::AbstractVector, availability)
+    J = length(utils)
+    N, R = size(utils[1])
     T = eltype(first(utils))
 
-    # Stack utils into a single tensor U of size (N, J, R)
+    # Stack utils into a single tensor of size (N, J, R). `expU` holds exp(u - m)
+    # first and is normalized into the probabilities in place at the end.
     expU = Array{T}(undef, N, J, R)
     s_expU = Array{T}(undef, N, R)
 
@@ -173,18 +194,28 @@ function logit_prob(
             # cancels in the ratio) but keeps the largest term at exp(0)=1.
             m = fill(T(-Inf), N)
             for j in 1:J
-                m .= ifelse.(availability[j], max.(m, utils[j][:, r]), m)
+                m .= ifelse.(availability[j], max.(m, @view(utils[j][:, r])), m)
             end
+            # Accumulate the normalizer as the columns are written, rather than
+            # re-reading the slab with `sum(expU[:, :, r]; dims=2)` afterwards.
+            # Sequential in `j`, which is the order `sum` reduces in, so the result
+            # is bit-for-bit what it was.
+            s = @view s_expU[:, r]
+            fill!(s, zero(T))
             for j in 1:J
-                u = utils[j][:, r]
-                expU[:, j, r] .= ifelse.(availability[j], exp.(u .- m), 0.0)
+                u = @view utils[j][:, r]
+                e = @view expU[:, j, r]
+                e .= ifelse.(availability[j], exp.(u .- m), 0.0)
+                s .+= e
             end
-            s_expU[:, r] .= sum(expU[:, :, r]; dims = 2)
         end
     end
-    @inbounds probs = expU ./ max.(reshape(s_expU, N, 1, R), T(1e-30))
 
-    return probs
+    # Normalize in place: `expU` becomes the probability tensor. Allocating a
+    # separate `probs` here cost one full N × J × R tensor of Duals per call.
+    @inbounds expU ./= max.(reshape(s_expU, N, 1, R), T(1e-30))
+
+    return expU
 end
 
 """
