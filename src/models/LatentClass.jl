@@ -896,10 +896,25 @@ function estimate(model::LatentClassModel, choicevar::Symbol; verbose::Bool = tr
     )
 end
 
-function evaluate(
+"""
+Evaluates derived expressions (e.g. WTP, elasticities) from a fitted `LatentClassModel`,
+with delta-method standard errors.
+
+`collect_parameters` descends into the class models, so a class-specific quantity is
+written with that class's own parameters (`b_tt_1 / b_tc_1` is class 1's WTP) and gets
+the standard error implied by the full covariance matrix — including its covariance with
+the class-membership parameters, which a per-class calculation would miss.
+
+There is deliberately no automatic class-probability-weighted average. Which classes to
+pool, and whether a weighted mean of class WTPs is even the quantity of interest, is the
+analyst's call; and any such average is itself writable as an expression over the same
+parameters, which then gets its standard error from the same delta method.
+
+Draws are refused for the same reason as in `MixedLogitModel` (see `delta_method`) —
+which is what a Mixed Logit class would introduce here.
+"""
+evaluate(
     expressions::Dict{Symbol, <:DCMExpression},
     model::LatentClassModel,
     results::NamedTuple
-)
-    error("Evaluate for LatentClassModel is not implemented yet")
-end
+) = delta_method(expressions, collect_parameters(model.expr), model.data, results)

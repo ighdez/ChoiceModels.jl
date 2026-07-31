@@ -73,6 +73,31 @@ results = estimate(model, :CHOICE)
 
 # Output results
 summarize_results(results, file="output/MXL_swissmetro.xlsx")
+println('\n')
+
+# Evaluate WTP.
+#
+# β_time is RANDOM here (`mu_time + s_time * Draw(:d_time)`), so "the" value of
+# time is not one number and the expression has to say which one is meant. Each of
+# these is a function of the taste distribution's PARAMETERS, which are ordinary
+# estimated parameters, so each gets an exact delta-method standard error.
+#
+# Writing `β_time / β_cost` — i.e. including the draw — is an error rather than a
+# silent average over draws: the mean of a ratio of two normals does not exist, so
+# that average would drift with R and the seed while reporting a confident-looking
+# standard error. `evaluate` says so if you try it.
+# Note the percentiles are percentiles OF β_time, which is negative: its 10th
+# percentile is the most negative time coefficient and therefore the HIGHEST value
+# of time. The two are not a symmetric interval around the mean either, because
+# β_cost is in the denominator.
+expressions = Dict(
+    :VoT_at_mean_beta => mu_time / β_cost,
+    :VoT_at_p10_beta  => (mu_time - 1.2816 * s_time) / β_cost,
+    :VoT_at_p90_beta  => (mu_time + 1.2816 * s_time) / β_cost,
+)
+
+wtp = evaluate(expressions, model, results)
+summarize_expressions(wtp, file="output/MXL_swissmetro_WTP.xlsx")
 
 # Predict
 # preds = predict(model,results)

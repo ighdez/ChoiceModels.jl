@@ -603,13 +603,24 @@ function estimate(model::MixedLogitModel, choicevar::Symbol; verbose::Bool = tru
     )
 end
 
-function evaluate(
+"""
+Evaluates derived expressions (e.g. WTP, elasticities) from a fitted `MixedLogitModel`,
+with delta-method standard errors.
+
+The expression must be a function of the **estimated parameters** — for a random
+coefficient that means the parameters of its taste distribution, not the coefficient
+itself. WTP at the mean of a normally-distributed time coefficient is `mu_time / β_cost`;
+the median under a lognormal spec `-exp(mu + σ·ξ)` is `exp(mu_time) / exp(mu_cost)`.
+
+An expression containing a `Draw` is an error, not an average over the draws: see
+`delta_method`, which spells out the three distinct quantities that notation conflates
+and why only this one has a delta-method standard error at all.
+"""
+evaluate(
     expressions::Dict{Symbol, <:DCMExpression},
     model::MixedLogitModel,
     results::NamedTuple
-)
-    error("Evaluate for MixedLogitModel is not implemented yet")
-end
+) = delta_method(expressions, collect_parameters(model.utilities), model.data, results)
 
 # The symbolic children the `collect_*` walkers descend into when this model is
 # nested inside another expression. See the traversal note in `Utils.jl`.

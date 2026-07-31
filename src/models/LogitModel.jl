@@ -393,52 +393,8 @@ Uses the Delta method to compute standard errors (both classical and robust) via
     - `std_error`: standard error using classical variance
     - `robust_std_error`: standard error using robust variance
 """
-function evaluate(
+evaluate(
     expressions::Dict{Symbol, <:DCMExpression},
     model::LogitModel,
     results::NamedTuple
-)
-    # The delta method needs a covariance matrix; there is none when the BHHH
-    # matrix was singular (see `covariance_estimates`), so fail with the reason
-    # rather than on `g' * nothing * g`.
-    if isnothing(results.vcov) || isnothing(results.rob_vcov)
-        error("""
-              Cannot evaluate derived expressions: no covariance matrix was computed for this \
-              model (the BHHH matrix was singular at the optimum), and the standard error of a \
-              derived quantity is obtained from it by the delta method. See the warning issued \
-              during estimation for the unidentified parameter(s).
-              """)
-    end
-
-    # 1. Extraer nombres de parámetros libres y su orden
-    all_params = collect_parameters(model.utilities)
-    free_params = filter(p -> !p.fixed, all_params)
-    free_names = [p.name for p in free_params]
-    θ̂ = [results.parameters[n] for n in free_names]
-
-    output = Dict{Symbol, NamedTuple{(:value, :std_error, :robust_std_error), Tuple{Float64, Float64, Float64}}}()
-
-    for (name, expr) in expressions
-        # 2. Definir función escalar
-        f_expr = θ -> begin
-            param_dict = copy(results.parameters)
-            for (i, pname) in enumerate(free_names)
-                param_dict[pname] = θ[i]
-            end
-            mean(evaluate(expr, model.data, param_dict))
-        end
-
-        # 3. Evaluar función y gradiente
-        val = f_expr(θ̂)
-        g = ForwardDiff.gradient(f_expr, θ̂)
-
-        # 4. Errores estándar
-        se_normal  = sqrt(g' * results.vcov * g)
-        se_robust  = sqrt(g' * results.rob_vcov * g)
-
-        # 5. Almacenar resultados
-        output[name] = (value = val, std_error = se_normal, robust_std_error = se_robust)
-    end
-
-    return output
-end
+) = delta_method(expressions, collect_parameters(model.utilities), model.data, results)

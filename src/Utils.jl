@@ -16,12 +16,26 @@
 # as long as it subtypes `DCMBinary`/`DCMUnary` (children under `.left`/`.right`
 # or `.arg`) or gets its own `_children` method.
 #
-# TRAVERSAL ORDER IS LOAD-BEARING. `collect_parameters` returns `values(seen)` of
-# a `Dict`, whose iteration order follows insertion order, which follows this
-# traversal. That order fixes the layout of θ and therefore of every covariance
-# matrix, so perturbing it would change the optimizer's path and shift the last
-# digits of every recorded log-likelihood. Visit the node first, then its
-# children left-to-right, exactly as the original closures did.
+# TRAVERSAL ORDER IS LOAD-BEARING, and the collectors now actually preserve it.
+# The order in which parameters come back fixes the layout of θ and therefore of
+# every covariance matrix and every reported row; the order in which *draws* come
+# back fixes which Halton base each random dimension is assigned (see
+# `generate_draws`), and therefore the simulated likelihood itself.
+#
+# They used to accumulate into a `Dict` and return `values(seen)`/`keys(seen)`.
+# The comment here claimed that followed insertion order. It does not — Julia's
+# `Dict` is hash-ordered, and measured on the `MXL_swissmetro` spec it returned
+# the nine parameters as [:s_asc_car, :β_cost, :s_asc_train, …] against a
+# first-seen [:mu_asc_train, :s_asc_train, …], i.e. fully scrambled. The result
+# was deterministic but arbitrary, and arbitrary *in a way that depends on
+# `Dict`'s internals* — so a Julia upgrade could silently permute θ, reassign the
+# Halton bases and move every simulated log-likelihood in this package.
+#
+# So dedup now goes through a `Set` while a `Vector` keeps first-seen order.
+# Same traversal (node first, then children left-to-right), order now guaranteed
+# by the collector rather than by a hash table. Note "first-seen" also settles
+# which object wins when one name is bound twice: the first occurrence, where the
+# `Dict` version kept the last.
 # ---------------------------------------------------------------------------
 
 # Leaves, and any node that has not declared children.
@@ -59,16 +73,21 @@ descending into any model nested inside the expressions (as in a latent class).
 - `utilities::Vector{<:DCMExpression}`: vector of symbolic utility expressions
 
 # Returns
-- `Vector{DCMParameter}`: unique parameters used in the utilities
+- `Vector{DCMParameter}`: unique parameters used in the utilities, in **first-seen
+  traversal order** — which is the order they are reported in and the layout of θ
 """
 function collect_parameters(utilities::Vector{<:DCMExpression})
-    seen = Dict{Symbol, DCMParameter}()
+    seen = Set{Symbol}()
+    out = DCMParameter[]
     for u in utilities
         _walk(u) do e
-            e isa DCMParameter && (seen[e.name] = e)
+            if e isa DCMParameter && !(e.name in seen)
+                push!(seen, e.name)
+                push!(out, e)
+            end
         end
     end
-    return collect(values(seen))
+    return out
 end
 
 function collect_parameters(expr::DCMExpression)
@@ -87,13 +106,17 @@ Traverses the expression trees to find all `DCMVariable` symbols.
 - `Vector{Symbol}`: names of variables appearing in the expressions
 """
 function collect_variables(utilities::Vector{<:DCMExpression})
-    seen = Dict{Symbol, Bool}()
+    seen = Set{Symbol}()
+    out = Symbol[]
     for u in utilities
         _walk(u) do e
-            e isa DCMVariable && (seen[e.name] = true)
+            if e isa DCMVariable && !(e.name in seen)
+                push!(seen, e.name)
+                push!(out, e.name)
+            end
         end
     end
-    return collect(keys(seen))
+    return out
 end
 
 """
@@ -105,16 +128,22 @@ Used for identifying the random terms in Mixed Logit specifications.
 - `expr::DCMExpression`: symbolic utility expression
 
 # Returns
-- `Vector{Symbol}`: names of draws used in the expression
+- `Vector{Symbol}`: names of draws used in the expression, in **first-seen traversal
+  order**. That order is not cosmetic: `generate_draws` assigns Halton bases by a
+  dimension's position in this list, so it fixes the draws themselves.
 """
 function collect_draws(utilities::Vector{<:DCMExpression})
-    seen = Dict{Symbol, Bool}()
+    seen = Set{Symbol}()
+    out = Symbol[]
     for u in utilities
         _walk(u) do e
-            e isa DCMDraw && (seen[e.name] = true)
+            if e isa DCMDraw && !(e.name in seen)
+                push!(seen, e.name)
+                push!(out, e.name)
+            end
         end
     end
-    return collect(keys(seen))
+    return out
 end
 
 collect_draws(expr::DCMExpression) = collect_draws([expr])
@@ -830,6 +859,127 @@ function covariance_estimates(H::AbstractMatrix, G::AbstractMatrix, free_names::
         bhhh_vcov       = bhhh_vcov,
         bhhh_std_errors = as_dict(guarded_std_errors(bhhh_vcov, free_names, "BHHH/OPG covariance")),
     )
+end
+
+# ---------------------------------------------------------------------------
+# Derived quantities: the delta method
+#
+# `evaluate(expressions, model, results)` was implemented twice, identically, in
+# `LogitModel.jl` and `NestedLogit.jl`, and was an `error("not implemented yet")`
+# stub in `MixedLogit.jl` and `LatentClass.jl`. Two copies of one algorithm is
+# exactly the hazard the Architecture section of CLAUDE.md opens with, so the
+# algorithm now lives here once and the four models differ only in how they name
+# their free parameters. Nothing about the delta method is model-specific: it
+# reads θ̂ and a covariance matrix, both of which every `estimate` reports in the
+# SAME space it reports its estimates in (`NestedLogitModel` converts H and G to λ
+# space before `covariance_estimates`, so its `vcov` needs no further correction
+# here — see its `estimate`).
+# ---------------------------------------------------------------------------
+
+"""
+    delta_method(expressions, all_params, data, results)
+
+Standard errors for derived quantities (WTP, elasticities, ratios of parameters)
+by the delta method: for a scalar `g(θ)`, `Var(g) = ∇g' V ∇g`, with `∇g` taken by
+`ForwardDiff` and `V` the classical and robust covariance matrices in turn.
+
+`all_params` is the model's full parameter list in the same order `estimate` used
+(so the gradient lines up with the covariance matrix once the fixed ones are
+dropped); `data` is the model's `DataFrame`, since an expression may reference
+`Variable`s and the reported value is then their sample mean.
+
+# What this can and cannot express, for the simulated models
+
+The target is a **deterministic function of the estimated parameters**, evaluated
+at θ̂. That is Apollo's `apollo_deltaMethod`, and for a Mixed Logit it is the right
+tool for exactly the quantities people report: WTP at the mean of a taste
+distribution (`mu_time / β_cost`), at its median under a lognormal
+(`exp(mu_t) / exp(mu_c)`), or any other functional of the *distribution's
+parameters*, which are ordinary estimated parameters like any others.
+
+What it deliberately refuses is an expression containing a `Draw`. WTP is then a
+ratio of two *random* coefficients and there are three different targets hiding
+behind one piece of notation:
+
+1. **WTP at a point of the taste distribution** (mean, median, a quantile) — a
+   function of the distribution's parameters. Supported: write it that way.
+2. **The mean of WTP over the taste distribution**, `E[β_t(ξ)/β_c(ξ)]` — refused.
+   For the common normal-over-normal specification this expectation **does not
+   exist** (the ratio is Cauchy-like, with no finite mean), so the simulated
+   average is not a noisy estimate of a parameter — it is an estimate of nothing,
+   and it drifts with `R` and the seed while reporting a small delta-method
+   standard error. Adding it would require knowing each coefficient's
+   distribution, which the symbolic API does not record.
+3. **The full simulated distribution of WTP** — not a scalar, so it has no delta
+   method at all. That is a `predict`-shaped feature, not this one.
+
+Silently computing (2) when the analyst wrote something that looks like (1) is the
+kind of plausible-looking wrong number this package has been bitten by before, so
+the `Draw` is an error with the above in the message rather than a default.
+"""
+function delta_method(
+    expressions::Dict{Symbol, <:DCMExpression},
+    all_params::AbstractVector{DCMParameter},
+    data::DataFrame,
+    results::NamedTuple,
+)
+    # The delta method needs a covariance matrix; there is none when the BHHH
+    # matrix was singular (see `covariance_estimates`), so fail with the reason
+    # rather than on `g' * nothing * g`.
+    if isnothing(results.vcov) || isnothing(results.rob_vcov)
+        error("""
+              Cannot evaluate derived expressions: no covariance matrix was computed for this \
+              model (the BHHH matrix was singular at the optimum), and the standard error of a \
+              derived quantity is obtained from it by the delta method. See the warning issued \
+              during estimation for the unidentified parameter(s).
+              """)
+    end
+
+    for (name, expr) in expressions
+        drawn = collect_draws(expr)
+        isempty(drawn) || error("""
+              Derived expression `$name` references draw(s) $(join(drawn, ", ")), and the delta \
+              method is not defined for it. A ratio of random coefficients is three different \
+              quantities depending on what you mean:
+
+                1. WTP at a point of the taste distribution (its mean, median, a quantile). \
+              This is a function of the distribution's PARAMETERS, so write it with those and \
+              drop the draw — e.g. `mu_time / β_cost` at the mean, or `exp(mu_time) / exp(mu_cost)` \
+              for the median of a lognormal spec. This is what is supported, and what Apollo's \
+              `apollo_deltaMethod` computes.
+                2. The mean of WTP over the taste distribution, E[β_t(ξ)/β_c(ξ)]. Not supported, \
+              and not merely unimplemented: for the usual normal-over-normal specification this \
+              expectation DOES NOT EXIST (the ratio is Cauchy-like), so the simulated average \
+              would drift with R and the seed while reporting a confident-looking standard error.
+                3. The whole simulated distribution of WTP. Not a scalar, so no delta method \
+              applies; take the draws from the model and summarize them yourself.
+              """)
+    end
+
+    free_names = [p.name for p in all_params if !p.fixed]
+    θ̂ = [results.parameters[n] for n in free_names]
+
+    output = Dict{Symbol, NamedTuple{(:value, :std_error, :robust_std_error), Tuple{Float64, Float64, Float64}}}()
+
+    for (name, expr) in expressions
+        f_expr = θ -> begin
+            param_dict = copy(results.parameters)
+            for (i, pname) in enumerate(free_names)
+                param_dict[pname] = θ[i]
+            end
+            mean(evaluate(expr, data, param_dict))
+        end
+
+        val = f_expr(θ̂)
+        g = ForwardDiff.gradient(f_expr, θ̂)
+
+        se_normal = sqrt(g' * results.vcov * g)
+        se_robust = sqrt(g' * results.rob_vcov * g)
+
+        output[name] = (value = val, std_error = se_normal, robust_std_error = se_robust)
+    end
+
+    return output
 end
 
 """

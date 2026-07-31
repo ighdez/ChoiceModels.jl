@@ -114,6 +114,58 @@ using ForwardDiff
     #
     # This is not hypothetical: it was introduced during the walker refactor and
     # the entire suite passed with it in place — only three examples caught it.
+    @testset "walkers return first-seen traversal order" begin
+        # The collectors used to accumulate into a `Dict` and return
+        # `values(seen)`/`keys(seen)`, which is HASH order, not insertion order.
+        # That order fixes the layout of θ (and so every covariance matrix and
+        # every reported row) and — via `generate_draws` — which Halton base each
+        # random dimension is assigned, i.e. the simulated likelihood itself. It
+        # was therefore arbitrary in a way that depended on `Dict`'s internals, so
+        # a Julia upgrade could silently permute all of it.
+        #
+        # The names below are deliberately chosen so that alphabetical, reverse
+        # alphabetical and hash order all DISAGREE with the structural order. A
+        # test whose expected order happened to coincide with the hash order would
+        # pass under the old code and pin nothing.
+        z = Parameter(:z_first,  value=1.0)
+        a = Parameter(:a_second, value=2.0)
+        m = Parameter(:m_third,  value=3.0)
+
+        expr = z * Variable(:v_first) + a * Variable(:b_second) + m * Variable(:q_third)
+
+        @test [p.name for p in ChoiceModels.collect_parameters(expr)] ==
+              [:z_first, :a_second, :m_third]
+        @test ChoiceModels.collect_variables([expr]) ==
+              [:v_first, :b_second, :q_third]
+
+        # Draw order is the load-bearing one: it picks the Halton bases.
+        dexpr = z * Draw(:d_zulu) + a * Draw(:d_alpha) + m * Draw(:d_mike)
+        @test ChoiceModels.collect_draws([dexpr]) == [:d_zulu, :d_alpha, :d_mike]
+
+        # Order is by first appearance across the utility LIST, not within one
+        # expression only, and a name already seen does not move.
+        u1 = m * Variable(:x1)
+        u2 = z * Variable(:x2) + m * Variable(:x3)
+        @test [p.name for p in ChoiceModels.collect_parameters([u1, u2])] ==
+              [:m_third, :z_first]
+        @test ChoiceModels.collect_variables([u1, u2]) == [:x1, :x2, :x3]
+
+        # Pre-order: a node is visited before its children, so a parameter sitting
+        # above another in the tree comes back first regardless of depth.
+        nested = a * exp(z * Variable(:x)) + m
+        @test [p.name for p in ChoiceModels.collect_parameters(nested)] ==
+              [:a_second, :z_first, :m_third]
+
+        # Deduplication keeps the FIRST occurrence (the `Dict` version kept the
+        # last), which is what makes the starting value predictable when one name
+        # is bound twice.
+        dup_first = Parameter(:dup, value=10.0)
+        dup_later = Parameter(:dup, value=20.0)
+        collected = ChoiceModels.collect_parameters(dup_first * Variable(:x) + dup_later * Variable(:y))
+        @test length(collected) == 1
+        @test collected[1].value == 10.0
+    end
+
     @testset "walkers handle nodes with non-expression children" begin
         b = Parameter(:b, value=0.0)
         df = DataFrame(x = [1.0, 3.0], y = [2.0, 2.0])

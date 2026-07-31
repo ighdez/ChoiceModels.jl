@@ -799,51 +799,17 @@ end
 """
 Evaluates derived expressions (e.g. WTP, elasticities) based on a fitted NestedLogitModel.
 
-Mirrors the `LogitModel` method; the only difference is that the free-parameter list
-includes the nest scale parameters, and the covariance matrices it reads are already
-in λ space (see `estimate`), so the delta method needs no further correction.
+Delegates to the shared `delta_method`; the only thing specific to this model is that
+the free-parameter list includes the nest scale parameters. The covariance matrices it
+reads are already in λ space (`estimate` converts H and G before `covariance_estimates`),
+which is the same space `results.parameters` reports λ̂ in, so no further correction
+applies here.
 """
-function evaluate(
+evaluate(
     expressions::Dict{Symbol, <:DCMExpression},
     model::NestedLogitModel,
     results::NamedTuple
-)
-    if isnothing(results.vcov) || isnothing(results.rob_vcov)
-        error("""
-              Cannot evaluate derived expressions: no covariance matrix was computed for this \
-              model (the BHHH matrix was singular at the optimum), and the standard error of a \
-              derived quantity is obtained from it by the delta method. See the warning issued \
-              during estimation for the unidentified parameter(s).
-              """)
-    end
-
-    all_params = _nl_parameters(model)
-    free_params = filter(p -> !p.fixed, all_params)
-    free_names = [p.name for p in free_params]
-    θ̂ = [results.parameters[n] for n in free_names]
-
-    output = Dict{Symbol, NamedTuple{(:value, :std_error, :robust_std_error), Tuple{Float64, Float64, Float64}}}()
-
-    for (name, expr) in expressions
-        f_expr = θ -> begin
-            param_dict = copy(results.parameters)
-            for (i, pname) in enumerate(free_names)
-                param_dict[pname] = θ[i]
-            end
-            mean(evaluate(expr, model.data, param_dict))
-        end
-
-        val = f_expr(θ̂)
-        g = ForwardDiff.gradient(f_expr, θ̂)
-
-        se_normal = sqrt(g' * results.vcov * g)
-        se_robust = sqrt(g' * results.rob_vcov * g)
-
-        output[name] = (value = val, std_error = se_normal, robust_std_error = se_robust)
-    end
-
-    return output
-end
+) = delta_method(expressions, _nl_parameters(model), model.data, results)
 
 # ---------------------------------------------------------------------------
 # Display

@@ -94,3 +94,27 @@ results = estimate(lc_model, :CHOICE)
 # Output results
 summarize_results(results, file="output/LC2_swissmetro.xlsx")
 println('\n')
+
+# Evaluate WTP.
+#
+# `collect_parameters` descends into the class models, so each class's own value of
+# time is written with that class's parameters and gets the standard error implied
+# by the FULL covariance matrix — including its covariance with the class-membership
+# parameter `delta_1`, which a per-class calculation done by hand would miss.
+#
+# There is no automatic class-probability-weighted average, because whether pooling
+# the classes is the quantity of interest is the analyst's call. When it is, write
+# it — it is an expression over the same parameters, so it gets a standard error the
+# same way, as `:VoT_pooled` does here.
+prob_1_expr = exp(delta_1) / (exp(delta_1) + exp(delta_2))
+prob_2_expr = exp(delta_2) / (exp(delta_1) + exp(delta_2))
+
+expressions = Dict(
+    :VoT_class1 => β_time_1 / β_cost_1,
+    :VoT_class2 => β_time_2 / β_cost_2,
+    :VoT_pooled => prob_1_expr * (β_time_1 / β_cost_1) + prob_2_expr * (β_time_2 / β_cost_2),
+    :share_class1 => prob_1_expr,
+)
+
+wtp = evaluate(expressions, lc_model, results)
+summarize_expressions(wtp, file="output/LC2_swissmetro_WTP.xlsx")
