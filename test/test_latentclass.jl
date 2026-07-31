@@ -473,7 +473,7 @@ end
         for n in 1:N4
             Y4[n, df4.choice[n]] = true
         end
-        Y4_3d = repeat(Y4, outer=(1, 1, 6))   # MixedLogit's own loglikelihood wants N × J × R
+        choices4 = collect(df4.choice)        # MixedLogit's own loglikelihood wants positions
         alts4 = (a=1, b=2)
 
         # (1) σ ≡ 0 removes the randomness, so the Mixed Logit class is a plain
@@ -513,7 +513,7 @@ end
         # against a Mixed Logit holding those same draws.
         shared = ChoiceModels._lc_classes(lc_solo.expr)[1][2]
         @test sum(loglikelihood(lc_solo, Y4; parameters=p5)) ≈
-              sum(loglikelihood(shared, Y4_3d; parameters=p5))
+              sum(loglikelihood(shared, choices4; parameters=p5))
     end
 
     # Draw generation is taken over by the latent class so that a draw dimension

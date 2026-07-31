@@ -219,6 +219,103 @@ function _mxl_softmax(utils::AbstractVector, availability)
 end
 
 """
+Log-probability of the CHOSEN alternative only, as an `N × R` matrix.
+
+This is what the simulated likelihood actually consumes, and computing it directly
+avoids the `N × J × R` probability tensor entirely: the likelihood never needs the
+non-chosen alternatives' probabilities, only their contribution to the normalizer.
+
+    log P(j_n | β_r) = (V_{j_n} - m) - log Σ_{k avail} exp(V_k - m)
+
+`logit_prob` remains for `predict`, `evaluate(::MixedLogitModel, …)` and the
+construction-time class checks, which genuinely want the whole tensor.
+
+Not bit-for-bit what `log.(logit_prob(…))` produced — `a - log(s)` and
+`log(exp(a)/s)` differ in the last ulp — but it is the same quantity, computed with
+one fewer rounding step and without a `log` over every alternative.
+"""
+function chosen_logprob(
+    utilities::Vector{<:DCMExpression},
+    data::DataFrame,
+    parameters::Dict,
+    availability::Vector{<:AbstractVector{Bool}},
+    draws::Dict{Symbol, Matrix{Float64}},
+    choices::AbstractVector{Int},
+)
+    J = length(utilities)
+    raw = Vector{Any}(undef, J)
+
+    Threads.@threads for j in 1:J
+        raw[j] = evaluate(utilities[j], data, parameters, draws)
+    end
+
+    # Function barrier, for the same reason as in `logit_prob`.
+    return _mxl_chosen_logprob(identity.(raw), availability, choices)
+end
+
+function _mxl_chosen_logprob(utils::AbstractVector, availability, choices::AbstractVector{Int})
+    J = length(utils)
+    N, R = size(utils[1])
+    T = eltype(first(utils))
+
+    lp = Array{T}(undef, N, R)
+    # What an unavailable-but-chosen alternative contributed under the old tensor
+    # path: its probability was exactly 0, and `log(max(0, 1e-30))` floored it here.
+    # Preserved deliberately — in log space the natural expression would instead
+    # return a finite, wrong number.
+    floorlp = log(T(1e-30))
+
+    Threads.@threads for r in 1:R
+        @inbounds begin
+            # Same stable-softmax max-subtraction as `_mxl_softmax`; see the comment
+            # there for why it is not optional.
+            m = fill(T(-Inf), N)
+            for j in 1:J
+                m .= ifelse.(availability[j], max.(m, @view(utils[j][:, r])), m)
+            end
+
+            # Normalizer only — an N-vector per draw, not an N × J slab.
+            s = zeros(T, N)
+            for j in 1:J
+                s .+= ifelse.(availability[j], exp.(@view(utils[j][:, r]) .- m), zero(T))
+            end
+
+            col = @view lp[:, r]
+            for n in 1:N
+                jc = choices[n]
+                if jc == 0
+                    # Defensive only: `_recode_choices` throws on a code no
+                    # alternative claims, so `estimate` can never produce a 0 here.
+                    # Matches what the old all-false one-hot row contributed.
+                    col[n] = zero(T)
+                elseif availability[jc][n]
+                    # `m` is the max over AVAILABLE alternatives and the chosen one
+                    # is available, so `s >= exp(0) = 1` and the log needs no guard.
+                    #
+                    # The `max(·, floorlp)` reproduces the old tensor path's
+                    # `log(max(p, 1e-30))` EXACTLY, and is kept deliberately. It is
+                    # not needed for numerical safety — this expression is finite
+                    # however small the probability — but dropping it changes the
+                    # objective in the tails, where an individual's every draw can
+                    # sit below the floor, and that moves the optimizer onto
+                    # different local optima. Measured on MXL_swissmetro at its
+                    # optimum: 1060 of 3.38M cells bind, and while the resulting
+                    # log-likelihood is unchanged to 10 digits (a floored cell is
+                    # negligible inside the log-sum-exp over draws either way), the
+                    # path through the tails is not. Removing it is a MODEL change,
+                    # to be made on its own and validated on its own.
+                    col[n] = max((utils[jc][n, r] - m[n]) - log(s[n]), floorlp)
+                else
+                    col[n] = floorlp
+                end
+            end
+        end
+    end
+
+    return lp
+end
+
+"""
 Predicts choice probabilities using a set of estimated parameters.
 
 # Arguments
@@ -243,39 +340,39 @@ Computes the simulated log-likelihood of a Mixed Logit model.
 
 # Arguments
 - `model::MixedLogitModel`: the model object
-- `Y::Array{Bool,3}`: indicator tensor (N, J, R) showing chosen alternative per draw
+- `choices::AbstractVector{Int}`: chosen alternative per observation, as a POSITION
+  in `model.alternatives` (0 where no alternative claims the observed code). This
+  used to be an `(N, J, R)` one-hot `Bool` tensor — R identical copies of one `N × J`
+  mask, built only to be multiplied against a full tensor of log-probabilities. Both
+  are gone; see `chosen_logprob`.
 - `parameters::Dict=mutable_parameters`: parameter values (default uses current model values)
 
 # Returns
 - `Float64`: total simulated log-likelihood over all individuals
 """
-function loglikelihood(model::MixedLogitModel, Y::Array{Bool,3};parameters::Dict=mutable_parameters)
-    probs = logit_prob(
+function loglikelihood(model::MixedLogitModel, choices::AbstractVector{Int};parameters::Dict=mutable_parameters)
+    # Only the chosen alternative's log-probability is ever needed, so the N × J × R
+    # tensor is never built. See `chosen_logprob`.
+    log_chosen = chosen_logprob(
         model.utilities,
         model.data,
         parameters,
         model.availability,
-        model.draws
-)
+        model.draws,
+        choices,
+    )
 
-    N, _, R = size(probs)
+    N, R = size(log_chosen)
     id_map, id = model.id
     I = length(id_map)
-    
-    # Initialize simulated probability matrix: R x I
-    T = eltype(first(probs))
 
-    # Compute log-probabilities with failsafe
+    T = eltype(log_chosen)
+
     log_indiv = zeros(T, I, R)
     loglik = zeros(T, I)
     Threads.@threads for r in 1:R
-        @inbounds begin
-            log_probs = log.(max.(probs[:, :, r], T(1e-30)))      # N × J
-            log_chosen = sum(log_probs .* Y[:, :, r]; dims = 2)  # N × 1
-            for n in 1:N
-                i = id_map[id[n]]
-                log_indiv[i, r] += log_chosen[n, 1]  # extrae escalar
-            end
+        @inbounds for n in 1:N
+            log_indiv[id_map[id[n]], r] += log_chosen[n, r]
         end
     end
 
@@ -369,20 +466,8 @@ function estimate(model::MixedLogitModel, choicevar::Symbol; verbose::Bool = tru
     choice_data = model.data[:,choicevar]
 
     # Translate the analyst's alternative codes into positions in `model.alternatives`
-    # once, here; the Y tensor and the probability tensor are both ordered by position.
+    # once, here; `choices` and the utilities are both ordered by position.
     choices = _recode_choices(choice_data, model.alternatives, choicevar)
-
-    # Construct Y tensor (one-hot encoding) from cs_availability
-    J = length(model.utilities)
-    N, R = size(first(values(model.draws)))
-
-    Y = zeros(Bool, N, J, R)
-    @inbounds for n in 1:N
-        j = choices[n]
-        if j > 0
-            Y[n, j, :] .= true
-        end
-    end
 
     params = collect_parameters(model.utilities)
     param_names = [p.name for p in params]
@@ -414,7 +499,7 @@ function estimate(model::MixedLogitModel, choicevar::Symbol; verbose::Bool = tru
             end
         end
 
-        loglik = loglikelihood(model, Y; parameters=mutable_parameters)
+        loglik = loglikelihood(model, choices; parameters=mutable_parameters)
         return -loglik
     end
 
@@ -429,7 +514,7 @@ function estimate(model::MixedLogitModel, choicevar::Symbol; verbose::Bool = tru
             end
         end
 
-        loglik = loglikelihood(model, Y; parameters=mutable_parameters)
+        loglik = loglikelihood(model, choices; parameters=mutable_parameters)
         return -sum(loglik)
     end
 

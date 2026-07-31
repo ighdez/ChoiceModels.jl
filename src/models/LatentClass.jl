@@ -562,19 +562,31 @@ end
 # level further in.
 function _class_log_sequence(m::MixedLogitModel, data::DataFrame, Y::Matrix{Bool}, parameters,
                              id_map::Dict, id::AbstractVector, I::Int)
-    P = logit_prob(m.utilities, data, parameters, m.availability, m.draws)  # N × J × R
-    N, J, R = size(P)
-    T = eltype(P)
-    out = zeros(T, I, R)
+    # `chosen_logprob` wants positions, not a one-hot mask. Y is one-hot by
+    # construction (`estimate` sets a single column per row, none where no
+    # alternative claims the observed code), so this inverts it exactly.
+    N, J = size(Y)
+    choices = zeros(Int, N)
+    # NOTE the nesting: `for n in 1:N, j in 1:J` would flatten into a single loop
+    # and `break` would abandon ALL remaining observations, not just the rest of
+    # this row's alternatives.
+    @inbounds for n in 1:N
+        for j in 1:J
+            if Y[n, j]
+                choices[n] = j
+                break
+            end
+        end
+    end
+
+    # Straight to the chosen alternative's log-probability: the N × J × R tensor
+    # this used to build was only ever read at the chosen column.
+    lp = chosen_logprob(m.utilities, data, parameters, m.availability, m.draws, choices)  # N × R
+    R = size(lp, 2)
+    out = zeros(eltype(lp), I, R)
     @inbounds for r in 1:R
         for n in 1:N
-            p = zero(T)
-            for j in 1:J
-                if Y[n, j]
-                    p += P[n, j, r]
-                end
-            end
-            out[id_map[id[n]], r] += log(max(p, 1e-30))
+            out[id_map[id[n]], r] += lp[n, r]
         end
     end
     return out

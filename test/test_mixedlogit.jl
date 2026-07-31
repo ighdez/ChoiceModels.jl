@@ -84,12 +84,7 @@ end
         @test minimum(utils1) < -700
         @test any(iszero, exp.(utils1))
 
-        Y = zeros(Bool, N, 2, R)
-        for n in 1:N
-            Y[n, choices[n], :] .= true
-        end
-
-        ll = sum(loglikelihood(model, Y; parameters=params))
+        ll = sum(loglikelihood(model, choices; parameters=params))
         expected = brute_force_simulated_ll(model, params, choices)
 
         @test isfinite(ll)
@@ -217,11 +212,13 @@ end
             df_lp = DataFrame(ID=ids, x1=randn(N_obs), x2=randn(N_obs),
                               choice=rand(1:2, N_obs))
             Y2 = zeros(Bool, N_obs, 2)
-            Y3 = zeros(Bool, N_obs, 2, 6)
             for n in 1:N_obs
                 Y2[n, df_lp.choice[n]] = true
-                Y3[n, df_lp.choice[n], :] .= true
             end
+            # The Mixed Logit likelihood takes chosen POSITIONS now, not a one-hot
+            # tensor; the latent-class path it is compared against still takes the
+            # N × J mask.
+            choices_lp = collect(df_lp.choice)
 
             alts_lp = (a=1, b=2)
             mu_lp = Parameter(:mu_lp, value=-0.3)
@@ -238,7 +235,7 @@ end
             same_draws = ChoiceModels._lc_classes(lc_lp.expr)[1][2]
 
             p = Dict(:mu_lp=>-0.3, :sg_lp=>0.4, :unit_lp=>1.0)
-            mxl_ll = loglikelihood(same_draws, Y3; parameters=p)
+            mxl_ll = loglikelihood(same_draws, choices_lp; parameters=p)
             lc_ll  = loglikelihood(lc_lp, Y2; parameters=p)
 
             @test sum(mxl_ll) ≈ sum(lc_ll)
