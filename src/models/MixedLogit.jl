@@ -11,10 +11,17 @@ Combines symbolic utility expressions (fixed and random parameters) with data an
 - `utilities::Vector{DCMExpression}`: utility expressions, in `alternatives` order
 - `availability::Vector{Vector{Bool}}`: availability flags, in `alternatives` order
 - `data::DataFrame`: dataset with individual choice observations
-- `id::Tuple{Dict, Vector}`: mapping from observation ID to panel structure
-- `parameters::Dict{Symbol, Float64}`: dictionary of parameter values (means, std devs, etc.)
-- `draws::Dict{Symbol, Matrix{Float64}}`: simulation draws (size: `N × R`)
+- `id::Tuple{Dict, Vector}`: the panel structure, as `(id => row-block index, the raw
+  ID column)`. The likelihood uses it to accumulate an individual's observations
+  inside the draw integral
+- `parameters::Dict`: parameter values (means, standard deviations, etc.). Untyped
+  because the objective closures write ForwardDiff `Dual`s into the working copy
+- `draws::Dict`: simulation draws per draw name, each already expanded from
+  per-individual to per-observation (size `N × R`, `N = nrow(data)`)
 - `R::Int`: number of draws per individual
+- `draw_scheme::Symbol`: the scheme they were generated with. Stored because a
+  `LatentClassModel` inherits it when it takes over draw generation for its classes
+  (see `_lc_share_draws`)
 """
 struct MixedLogitModel <: DiscreteChoiceModel
     alternatives::NamedTuple                        # Alternative name => choice-column code
@@ -31,7 +38,10 @@ end
 """
 Constructs a `MixedLogitModel` from symbolic utility expressions and model inputs.
 
-Automatically generates draws for all random parameters using the specified scheme.
+Draws are generated for every `Draw` symbol found in the utilities: `R` per
+**individual**, then expanded to one row per observation, so an individual's
+repeated choices integrate against the same taste draw. The ID column must be
+sorted, and this is asserted.
 
 # Arguments
 - `alternatives`: the alternative set, as a NamedTuple mapping each alternative's name
@@ -41,10 +51,15 @@ Automatically generates draws for all random parameters using the specified sche
   by name, so their order is irrelevant)
 - `availability`: availability vectors, likewise keyed by name
 - `data`: DataFrame with observations
-- `idvar`: column identifying the individual (panel structure and draw assignment)
-- `parameters`: dictionary with initial values (including means/sigmas)
-- `R`: number of draws per individual
-- `draw_scheme`: symbol indicating sampling method (`:normal`, `:uniform`, `:mlhs`, etc.)
+- `idvar`: column identifying the individual (panel structure and draw assignment).
+  Required, and must be sorted
+- `parameters`: dictionary with initial values (including means/sigmas). Values on
+  the leaf `Parameter`s take precedence at estimation
+- `R`: number of draws per individual (default `100`). Memory scales linearly in it
+  — see the resource note in CLAUDE.md before raising it on a full dataset
+- `draw_scheme`: sampling method — `:normal` (default), `:uniform`, `:halton` or
+  `:mlhs`. `:halton` is what the examples use; the pseudo-random `:normal` default
+  is noisy enough at small `R` to move the optimizer onto different local optima
 
 # Returns
 - `MixedLogitModel` instance with utility functions and simulation-ready data
@@ -125,18 +140,30 @@ _with_draws(m::MixedLogitModel, draws::Dict, R::Int) =
 """
 Computes conditional choice probabilities for Mixed Logit using simulation draws.
 
-Evaluates utility expressions for each alternative and draw, then applies the softmax (MNL) formula
-across the alternatives, incorporating availability constraints.
+Evaluates utility expressions for each alternative and draw, then applies the stable
+softmax across the alternatives, incorporating availability constraints.
+
+**The likelihood does not go through here.** It calls `chosen_logprob`, which needs
+only the chosen alternative and so never materializes the `N × J × R` tensor — under
+`ForwardDiff` an element of that tensor is a nested `Dual` occupying 72 bytes at the
+chunk size `_hessian_config` sets, so the tensor is hundreds of megabytes on a
+realistic model. This function serves `predict`, `evaluate(::MixedLogitModel, …)` and
+the latent-class construction checks, which genuinely want every alternative.
 
 # Arguments
-- `utilities::Vector{<:DCMExpression}`: utility expressions per alternative
+- `utilities::Vector{<:DCMExpression}`: utility expressions, in the alternatives' order
 - `data::DataFrame`: dataset with variables
 - `parameters::Dict`: dictionary with values for all model parameters
-- `availability::Vector{Vector{Bool}}`: availability flags (length J, each vector of size N)
-- `draws::Dict{Symbol, Matrix{Float64}}`: draws per parameter (each of size N × R)
+- `availability::Vector{<:AbstractVector{Bool}}`: availability flags (length J, each
+  vector of length N)
+- `draws::Dict{Symbol, Matrix{Float64}}`: draws per draw name (each `N × R`)
+
+Note the argument order — `parameters` before `availability` — which differs from the
+`LogitModel` method of the same name.
 
 # Returns
-- `Array{Float64, 3}`: probability tensor of size N × J × R (individual, alternative, draw)
+- Probability tensor of size `N × J × R` (observation, alternative, draw); `0` for
+  unavailable alternatives. The element type follows `parameters`.
 """
 function logit_prob(
     utilities::Vector{<:DCMExpression},
@@ -323,7 +350,9 @@ Predicts choice probabilities using a set of estimated parameters.
 - `results::NamedTuple`: estimation results with field `parameters`
 
 # Returns
-- `Array{Float64,3}`: simulated probabilities of shape (N, J, R)
+- `Array{Float64,3}`: simulated probabilities of shape `(N, J, R)`, i.e. **conditional**
+  on each draw of the random coefficients. Average over the third dimension for the
+  unconditional probabilities — which is what `evaluate(::MixedLogitModel, …)` returns
 """
 function predict(model::MixedLogitModel, results)
     return logit_prob(
@@ -338,6 +367,14 @@ end
 """
 Computes the simulated log-likelihood of a Mixed Logit model.
 
+The contribution of individual `i` is `log (1/R) Σ_r Π_t P(j_t | β_r)`: the product
+over that individual's observations happens **inside** the draw average, because the
+random coefficients belong to the individual. Computing it the other way round
+(averaging draws per observation) is a different and wrong model. The draw average is
+taken by log-sum-exp rather than on probabilities — a sequence probability falls off
+exponentially in the panel length, and the old `max(·, 1e-30)` failsafe silently
+pinned every long-panel individual to the floor; see the comment at the loop.
+
 # Arguments
 - `model::MixedLogitModel`: the model object
 - `choices::AbstractVector{Int}`: chosen alternative per observation, as a POSITION
@@ -345,12 +382,17 @@ Computes the simulated log-likelihood of a Mixed Logit model.
   used to be an `(N, J, R)` one-hot `Bool` tensor — R identical copies of one `N × J`
   mask, built only to be multiplied against a full tensor of log-probabilities. Both
   are gone; see `chosen_logprob`.
-- `parameters::Dict=mutable_parameters`: parameter values (default uses current model values)
+- `parameters::Dict = model.parameters`: values to evaluate at. `estimate` passes the
+  dict its objective closures write into, so this is where the optimizer's current θ
+  (and, during differentiation, ForwardDiff `Dual`s) enters
 
 # Returns
-- `Float64`: total simulated log-likelihood over all individuals
+- `Vector`: one contribution per **individual**, not per observation, so `G` is
+  `I × K` and the resulting robust standard errors are clustered by individual. That
+  is intended and structural — see item 3 of the TODO section in CLAUDE.md
 """
-function loglikelihood(model::MixedLogitModel, choices::AbstractVector{Int};parameters::Dict=mutable_parameters)
+function loglikelihood(model::MixedLogitModel, choices::AbstractVector{Int};
+                       parameters::Dict = model.parameters)
     # Only the chosen alternative's log-probability is ever needed, so the N × J × R
     # tensor is never built. See `chosen_logprob`.
     log_chosen = chosen_logprob(
@@ -453,16 +495,9 @@ Uses optimization via `Optim.jl` to minimize the negative simulated log-likeliho
   Jacobian of the exact gradient (Apollo's routine). See `model_hessian!`
 
 # Returns
-- `NamedTuple` with fields:
-    - `parameters`: estimated values
-    - `std_errors`: classical standard errors
-    - `rob_std_errors`: robust standard errors (White)
-    - `vcov`: classical variance-covariance matrix
-    - `rob_vcov`: robust variance-covariance matrix
-    - `loglikelihood`: log-likelihood at optimum
-    - `iters`: number of iterations
-    - `converged`: whether the optimizer converged
-    - `estimation_time`: total runtime in seconds
+- `NamedTuple` with the same fields as `estimate(::LogitModel, …)`. Note that its
+  robust standard errors are **clustered by individual**, since the likelihood
+  returns one contribution per individual — see `loglikelihood`.
 """
 function estimate(model::MixedLogitModel, choicevar::Symbol; verbose::Bool = true,
                   hessian_method::Symbol = :ad)
@@ -642,13 +677,14 @@ Cross-sectional `evaluate` for a nested `MixedLogitModel` term: the **unconditio
 choice probabilities, `(1/R) Σ_r P(j | β_r)`, as an `N × J` matrix.
 
 WARNING — this is not the quantity a latent-class likelihood may be built from.
-Averaging over draws here collapses the `(N, J, R)` tensor before the product over
-an individual's observations has been taken, and the whole point of a panel Mixed
-Logit is that the product happens *inside* the integral: `log (1/R) Σ_r Π_t P_t(r)`,
-not `Σ_t log (1/R) Σ_r P_t(r)`. `loglikelihood(::LatentClassModel, …)` therefore
-calls `logit_prob` for the full tensor and never this method. What this is for is
-`predict`, and the construction-time class checks (`_check_class_weights`,
-`_check_class_separation`), which legitimately compare unconditional probabilities.
+Averaging over draws here collapses the draws before the product over an individual's
+observations has been taken, and the whole point of a panel Mixed Logit is that the
+product happens *inside* the integral: `log (1/R) Σ_r Π_t P_t(r)`, not
+`Σ_t log (1/R) Σ_r P_t(r)`. A Mixed Logit class inside a `LatentClassModel` therefore
+goes through `_class_log_sequence`, which calls `chosen_logprob` for the per-draw
+log-probabilities and never this method. What this is for is `predict`, and the
+construction-time class checks (`_check_class_weights`, `_check_class_separation`),
+which legitimately compare unconditional probabilities.
 """
 function evaluate(e::MixedLogitModel, data::DataFrame, params::AbstractDict)
     P = logit_prob(e.utilities, data, params, e.availability, e.draws)  # N × J × R

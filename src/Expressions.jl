@@ -209,8 +209,11 @@ end
 Represents a data variable used in utility expressions.
 
 # Fields
-- `name::Symbol`: name of the variable, typically a column in the dataset
-- `index::Union{Nothing, Int}`: optional index for panel data structure
+- `name::Symbol`: name of the variable, which must match a column of the model's data
+- `index::Union{Nothing, Int}`: reserved, and currently inert. Both `evaluate`
+  paths read the column as `data[:, name]` and never consult this field, so
+  setting it changes nothing. Panel structure is carried by the models' `idvar`
+  instead (`MixedLogitModel`, `LatentClassModel`), not here.
 """
 struct DCMVariable <: DCMExpression
     name::Symbol
@@ -222,7 +225,8 @@ Constructor for `DCMVariable`.
 
 # Arguments
 - `name::Symbol`: variable name (must match column name in data)
-- `index=nothing`: optional index for individual-specific variables
+- `index=nothing`: stored on the node but not used by either evaluation path; see
+  `DCMVariable`
 
 # Returns
 - `DCMVariable` object
@@ -258,13 +262,22 @@ end
 """
 Evaluates a symbolic utility expression for all observations in a dataset.
 
+One method per node type: dispatch replaces the former `if expr isa …` ladder, so
+each method is type-stable and the fully concrete tree type lets the whole
+expression inline. A new `DCMExpression` subtype therefore needs **both** an
+`evaluate` method here and an `_evaluate_draws` method below — missing either is a
+`MethodError` at run time, since the old catch-all `error("Unknown expression
+type")` fallthrough is gone.
+
 # Arguments
 - `expr::DCMExpression`: symbolic expression to evaluate
 - `data::DataFrame`: dataset with values for variables
 - `params::AbstractDict`: dictionary with parameter names and values
 
 # Returns
-- `Vector{Float64}`: evaluated numeric result for each observation
+- `Vector`, one entry per row of `data`. The element type follows the values in
+  `params`: `Float64` when evaluating at plain numbers, and a ForwardDiff `Dual`
+  during estimation, which is why nothing here annotates a concrete return type.
 """
 # One method per node type — dispatch replaces the former `if expr isa …` ladder,
 # so each method is type-stable and specializable (the `LogitModel` case lives in
@@ -294,14 +307,22 @@ Evaluates a symbolic expression for all observations and draws in Mixed Logit mo
 This version supports replication of data over simulation draws and handles parameter values,
 random draws, and data variables.
 
+The recursion is lazy — `_evaluate_draws` returns unmaterialized `Base.broadcasted`
+nodes, and this wrapper materializes the whole fused broadcast once — so a utility
+costs roughly one `N × R` allocation rather than one per node. See the comment
+below the signature.
+
 # Arguments
 - `expr::DCMExpression`: the symbolic expression to evaluate
 - `data::DataFrame`: the dataset (N rows)
 - `params::AbstractDict`: mapping from parameter names to values
-- `draws::AbstractDict`: dictionary of random draws, each as an `N × R` array
+- `draws::AbstractDict`: dictionary of random draws, each as an `N × R` matrix
 
 # Returns
-- `Array{Float64, 2}`: evaluated result of shape `N × R`
+- A matrix of shape `N × R`, guaranteed even for a draw-free subtree (`_as_nxr`
+  broadcasts it up), since `logit_prob` relies on that shape. As in the
+  cross-sectional method, the element type follows `params` and is a ForwardDiff
+  `Dual` during estimation.
 """
 # ---- N×R draws path --------------------------------------------------------
 # Public entry recurses with `_evaluate_draws`, whose leaves keep their natural

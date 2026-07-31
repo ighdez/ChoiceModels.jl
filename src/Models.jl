@@ -1,7 +1,16 @@
 """
-Defines the abstract type DiscreteChoiceModel and the generic interface for models in ChoiceModels.jl.
+Base type for every discrete choice model in ChoiceModels.jl.
 
-This module establishes the base interface all discrete choice models must follow, including predict, loglikelihood, and estimate. Specific models (e.g., Logit, Mixed Logit) must subtype DiscreteChoiceModel and implement these methods.
+A model is expected to provide `estimate(model, choicevar)`, `predict(model, results)`,
+`loglikelihood(model, choices)`, an `evaluate(model, data, params)` giving its `N × J`
+choice probabilities, and a `_children` method so the `collect_*` walkers can reach the
+expressions it holds. There is no enforced interface — the methods are defined per model
+in `models/`, and a missing one surfaces as a `MethodError`.
+
+**It subtypes `DCMExpression` on purpose**: that is what lets a fitted model appear as a
+term inside a symbolic expression, which is how a `LatentClassModel` is written
+(`π_1 * model_1 + π_2 * model_2`). A model is therefore something the tree walkers must
+descend into, not a leaf.
 """
 abstract type DiscreteChoiceModel <: DCMExpression end
 

@@ -523,9 +523,6 @@ nl_prob(
     parameters::AbstractDict
 ) = exp.(nl_logprob(utilities, data, availability, plan, parameters))
 
-# Cross-sectional `evaluate` for a nested NestedLogitModel term, mirroring the
-# `LogitModel` method — this is what lets an NL serve as a class inside a
-# `LatentClassModel` expression.
 # The symbolic children the `collect_*` walkers descend into when this model is
 # nested inside another expression. See the traversal note in `Utils.jl`.
 #
@@ -544,6 +541,10 @@ _children(m::NestedLogitModel) =
 # so the inner model's estimation space survives being nested.
 _log_scale_names(m::NestedLogitModel) = (l.name for l in _nl_lambda_parameters(m.plan))
 
+# Cross-sectional `evaluate` for a nested `NestedLogitModel` term, mirroring the
+# `LogitModel` method — this is what lets an NL serve as a class inside a
+# `LatentClassModel` expression. `params` carries λ in MODEL space; `estimate`'s
+# closures convert out of θ = log λ before calling in.
 evaluate(e::NestedLogitModel, data::DataFrame, params::AbstractDict) =
     nl_prob(e.utilities, data, e.availability, e.plan, params)
 
@@ -566,9 +567,16 @@ Computes the log-likelihood of the model given observed choices.
 # Arguments
 - `model::NestedLogitModel`: model object with defined parameters
 - `choices::Vector{Int}`: **positions** of the chosen alternatives (see `_recode_choices`)
+- `parameters::Dict = model.parameters`: values to evaluate at, with λ in **model
+  space** — `estimate`'s closures apply `exp` to the log-scale entries of θ before
+  passing the dict in
 
 # Returns
-- `Vector`: log-likelihood contribution per observation
+- `Vector`: log-likelihood contribution per observation. Like `LogitModel`, and
+  unlike Mixed Logit and the panel Latent Class, this model is per-observation by
+  construction, so its robust standard errors are not clustered — which is why they
+  differ from an Apollo script calling `apollo_panelProd` (see item 3 of the TODO
+  section in CLAUDE.md)
 """
 function loglikelihood(model::NestedLogitModel, choices::Vector{Int}; parameters::Dict = model.parameters)
     logP = nl_logprob(model.utilities, model.data, model.availability, model.plan, parameters)

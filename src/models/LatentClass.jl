@@ -6,9 +6,12 @@ Data structure for latent class models.
 # Fields
 - `alternatives::NamedTuple`: alternative name => code in the choice column, inherited
   from the class models (see `_lc_alternatives`)
-- `expr::DCMExpression`: the class mixture, normally `Σ_c π_c * model_c`
+- `expr::DCMExpression`: the class mixture, normally `Σ_c π_c * model_c`. Unlike the
+  other three models this holds one expression, not a vector of utilities; the panel
+  likelihood recovers the individual class terms from it with `_lc_classes`
 - `data::DataFrame`: input dataset
-- `id`: panel structure (`nothing` for cross-sectional data)
+- `id`: panel structure as `(id => row-block index, the raw ID column)`, or `nothing`
+  for cross-sectional data. Which one it is selects the likelihood (see `loglikelihood`)
 - `parameters::Dict`: parameter values (estimates or fixed)
 """
 struct LatentClassModel <: DiscreteChoiceModel
@@ -555,11 +558,12 @@ end
 
 # Mixed Logit class: the random coefficients belong to the INDIVIDUAL, so the
 # product over their observations has to happen inside the integral, i.e. at fixed
-# `r`. That is why this reads the full `(N, J, R)` tensor rather than the
-# draw-averaged `N × J` matrix `evaluate(::MixedLogitModel, …)` returns — averaging
-# first would give `Σ_t log (1/R) Σ_r P_t(r)`, a different and wrong model. It is
-# the same error as mixing classes per observation instead of per individual, one
-# level further in.
+# `r`. That is why this returns an `I × R` matrix of per-draw log sequence
+# probabilities rather than going through the draw-averaged `N × J` matrix that
+# `evaluate(::MixedLogitModel, …)` returns — averaging first would give
+# `Σ_t log (1/R) Σ_r P_t(r)`, a different and wrong model. It is the same error as
+# mixing classes per observation instead of per individual, one level further in.
+# The draw average itself is taken by the caller, after this returns.
 function _class_log_sequence(m::MixedLogitModel, data::DataFrame, Y::Matrix{Bool}, parameters,
                              id_map::Dict, id::AbstractVector, I::Int)
     # `chosen_logprob` wants positions, not a one-hot mask. Y is one-hot by
@@ -606,9 +610,33 @@ Two regimes, selected by whether the model was built with an `idvar`:
   per observation instead (`Π_t Σ_c π_c P_c(j_t)`) is a different, incorrect
   model. Returns one contribution per individual.
 
+With Mixed Logit classes the ordering goes one level deeper still:
+`L_i = Σ_c π_c · (1/R) Σ_r Π_t P_c(j_t | β_cr)` — observations multiplied innermost,
+then draws averaged, then classes mixed. That is Apollo's
+`apollo_mnl` → `apollo_panelProd` → `apollo_avgInterDraws` → `apollo_lc`, and it is
+what the `_class_log_sequence` contract (an `I × R` matrix of log *sequence*
+probabilities) exists to enforce.
+
 The panel path is computed in logs throughout and mixed with a log-sum-exp, so
 long choice sequences (whose sequence probabilities underflow `Float64` quickly)
 stay representable.
+
+# Arguments
+- `model::LatentClassModel`: the model object
+- `Y::Matrix{Bool}`: `N × J` one-hot matrix of the observed choices, built once by
+  `estimate` from the recoded choice positions (a row is all-`false` only if no
+  alternative claimed the observed code, which `_recode_choices` already refuses)
+- `parameters::Dict = model.parameters`: values to evaluate at
+
+# Returns
+- `Vector`: one contribution per observation on the cross-sectional path, and one
+  per **individual** on the panel path — so panel robust standard errors are
+  clustered by individual, which is intended (see item 3 of the TODO section in
+  CLAUDE.md)
+
+Throws on the panel path when the expression does not decompose into
+`Σ_c weight * model` terms, rather than falling back to the per-observation
+mixture, which would silently be a different model.
 """
 function loglikelihood(model::LatentClassModel, Y::Matrix{Bool}; parameters::Dict = model.parameters)
     if isnothing(model.id)
@@ -718,6 +746,45 @@ end
 # `Utils.jl`.
 _children(m::LatentClassModel) = (m.expr,)
 
+"""
+Estimates the parameters of a `LatentClassModel` by maximum likelihood.
+
+Optimizes the mixture likelihood described in `loglikelihood` — per observation on
+the cross-sectional path, per individual on the panel one. All of a class model's
+own parameters are estimated jointly with the class-membership parameters, since
+`collect_parameters` descends into the classes.
+
+**Estimation space is inherited from the classes.** A latent class has no transform
+of its own, but a `NestedLogitModel` class searches θ = log λ, and that has to
+survive being nested or the optimizer walks into λ ≤ 0 and the run dies as a `NaN`
+log-likelihood inside a line search. `collect_log_scale_parameters` builds the mask;
+`H` and `G` are converted back to model space by `curvature_in_model_space`
+**before** `covariance_estimates`, so all three covariance estimators — not just the
+classical one — come out in λ. With no such class the mask is all-`false` and every
+transform is the identity.
+
+**The class weights are re-checked at the optimum**, this time as a warning rather
+than an error: the constructor already threw if they were not a valid distribution
+at θ₀, but a spec with free unnormalized weights can leave the simplex during the
+search. The run is finished by then, so the estimates are shown alongside the reason
+to distrust the fit statistics.
+
+The null log-likelihood is taken from the first class's availability pattern, and is
+`NaN` when the expression does not decompose or carries no availability —
+`summarize_results` degrades ρ² to `NaN` rather than failing.
+
+# Arguments
+- `model::LatentClassModel`: model specification
+- `choicevar::Symbol`: name of the column in `model.data` that contains observed choices
+- `verbose::Bool=true`: whether to print optimization progress
+- `hessian_method::Symbol=:ad`: how to compute the Hessian the covariance matrices are
+  built from — `:ad` for exact ForwardDiff second derivatives, `:fd` for a finite-difference
+  Jacobian of the exact gradient (Apollo's routine). See `model_hessian!`
+
+# Returns
+- `NamedTuple` with the same fields as `estimate(::LogitModel, …)`, with λ reported
+  in model space for any nested-logit class.
+"""
 function estimate(model::LatentClassModel, choicevar::Symbol; verbose::Bool = true,
                   hessian_method::Symbol = :ad)
     # Validate before optimizing, not after: a typo'd method should not cost a full

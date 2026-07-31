@@ -97,13 +97,15 @@ end
 """
 Extracts all variable names used in a list of utility expressions.
 
-Traverses the expression trees to find all `DCMVariable` symbols.
+Traverses the expression trees to find all `DCMVariable` symbols, descending into
+any model nested inside the expressions (as in a latent class).
 
 # Arguments
 - `utilities::Vector{<:DCMExpression}`: vector of symbolic utility expressions
 
 # Returns
-- `Vector{Symbol}`: names of variables appearing in the expressions
+- `Vector{Symbol}`: names of variables appearing in the expressions, in **first-seen
+  traversal order** (see the traversal note at the top of this file)
 """
 function collect_variables(utilities::Vector{<:DCMExpression})
     seen = Set{Symbol}()
@@ -120,15 +122,18 @@ function collect_variables(utilities::Vector{<:DCMExpression})
 end
 
 """
-Recursively collects all unique draw names (`Symbol`) from a symbolic expression.
+Collects all unique draw names (`Symbol`) from a symbolic expression, or from a
+vector of them.
 
-Used for identifying the random terms in Mixed Logit specifications.
+Used for identifying the random terms in Mixed Logit specifications: the result is
+the list of dimensions `generate_draws` is asked for.
 
 # Arguments
-- `expr::DCMExpression`: symbolic utility expression
+- `utilities::Vector{<:DCMExpression}`: symbolic utility expressions. A single
+  `expr::DCMExpression` is accepted too and is treated as a one-element vector
 
 # Returns
-- `Vector{Symbol}`: names of draws used in the expression, in **first-seen traversal
+- `Vector{Symbol}`: names of draws used in the expressions, in **first-seen traversal
   order**. That order is not cosmetic: `generate_draws` assigns Halton bases by a
   dimension's position in this list, so it fixes the draws themselves.
 """
@@ -1068,24 +1073,54 @@ _hessian_label(status::Symbol) =
 Pretty-prints estimation results and optionally writes them to an Excel file.
 
 Displays parameter estimates with classical and robust (sandwich) standard errors,
-t-statistics and p-values. Optionally writes results to an Excel file (.xlsx) with
-two sheets:
-- "Estimates": full table of parameter results
-- "Summary"  : log-likelihood, iterations, convergence status, and runtime.
+t-statistics and p-values, followed by a model summary block. The console blocks
+and the spreadsheet are rendered from **one** estimates `DataFrame` and **one**
+summary row-list, so the two cannot drift apart; `test_stderrors.jl` pins that
+every exported summary label appears in the console output, in the same order.
+
+**BHHH/OPG is never presented**, even though `estimate` computes and returns it —
+see `covariance_estimates` for why (its justification is the information matrix
+equality, which fails in exactly the situations where it would be shown).
+
+Two states of the results object change what is printed:
+
+- **`hessian === :singular`** — this **throws**. The likelihood is flat in some
+  direction, so no classical covariance matrix exists and `_safe_inv`'s
+  pseudo-inverse would manufacture plausible-looking standard errors for an
+  unidentified parameter. Following Apollo, that is treated as an estimation error.
+  `estimate` still returns normally, so the caller keeps the estimates and the
+  verdict; what is refused is rendering them as a result table. `:indefinite` is
+  unaffected — those standard errors exist, they are merely untrustworthy, and the
+  `NOTE:` printed under the summary says so.
+- **`bhhh_matrix === :singular`** — every covariance field is `nothing`, so the
+  estimates are printed with no standard error columns at all, plus `BHHH matrix`
+  and `Covariance matrix` rows in the summary.
 
 # Arguments
-- `results::NamedTuple`: Named tuple returned from model estimation, containing fields:
-    - `parameters`: Dict of estimated parameter values
-    - `std_errors`: Dict of classical standard errors
-    - `rob_std_errors`: Dict of robust standard errors (optional)
-    - `loglikelihood`: log-likelihood value
-    - `iters`: number of iterations
-    - `converged`: convergence flag
-    - `estimation_time`: runtime in seconds
-- `file::Union{String, Nothing}`: Optional path to export results as Excel file.
+- `results::NamedTuple`: what a model's `estimate` returned. Fields consumed:
+    - `parameters`: Dict of estimated parameter values (in the model's *reporting*
+      space — for a nested logit that is λ̂, not log λ̂)
+    - `std_errors`, `rob_std_errors`: Dicts of classical and robust standard
+      errors, or `nothing` when no covariance matrix was computed
+    - `loglikelihood`, `null_loglikelihood`, `N`: for the fit statistics
+      (AIC, BIC, McFadden ρ²; ρ² degrades to `NaN` when the null LL is not finite)
+    - `free_parameters`: parameter count for AIC/BIC. Falls back to the size of
+      the standard error Dict on older results objects — a fallback that is
+      unavailable precisely when no covariance was computed, which is why the
+      field exists
+    - `iters`, `converged`, `estimation_time`: optimizer diagnostics
+    - `hessian`, `bhhh_matrix`: the `hessian_status`/`bhhh_matrix_status` verdicts.
+      The Hessian row is printed directly under `Converged` on purpose —
+      `Converged: true` above `Hessian at optimum: INDEFINITE` is a contradiction
+      the reader needs to see, and the `@warn` alone scrolls off the top of a long
+      optimizer trace. Skipped entirely when the field is absent
+- `file::Union{String, Nothing}`: optional path for an `.xlsx` export, with sheets
+  "Estimates" (the table) and "Summary" (the same labels and order as the console).
+  Intermediate directories are created, so a relative `"output/model.xlsx"` works
+  from a fresh clone.
 
 # Returns
-- Nothing. Prints output to console and optionally writes Excel file.
+- Nothing. Prints to the console, and writes the Excel file when `file` is given.
 """
 function summarize_results(results::NamedTuple; file::Union{String, Nothing}=nothing)
     params = results.parameters
@@ -1266,14 +1301,18 @@ end
 Pretty-prints results from evaluating derived expressions (e.g., WTP, elasticities),
 and optionally writes them to an Excel file.
 
-Displays values and their classical and robust standard errors, t-statistics and p-values.
+Displays values and their classical and robust standard errors, t-statistics and
+p-values. Takes what `evaluate(expressions, model, results)` returns; the standard
+errors are delta-method ones (see `delta_method`).
 
 # Arguments
-- `results::Dict{Symbol,<:NamedTuple}`: dictionary with results per expression, where each value has fields `value`, `std_error`, and `robust_std_error`
-- `file::Union{String, Nothing}`: Optional path to export results as Excel file.
+- `results::Dict{Symbol,<:NamedTuple}`: results per expression, each value having
+  fields `value`, `std_error` and `robust_std_error`
+- `file::Union{String, Nothing}`: optional path for an `.xlsx` export (single sheet,
+  "Expressions"). Intermediate directories are created.
 
 # Returns
-- Nothing. Prints output to console and optionally writes Excel file.
+- Nothing. Prints to the console, and writes the Excel file when `file` is given.
 """
 function summarize_expressions(results::Dict{Symbol,<:NamedTuple}; file::Union{String, Nothing}=nothing)
     println("Expression Evaluation\n======================\n")

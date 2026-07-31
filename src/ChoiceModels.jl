@@ -3,11 +3,18 @@ ChoiceModels.jl — A symbolic, extensible package for estimating Discrete Choic
 
 ## Features
 
-* Symbolic utility specification using `Parameter` and `Variable`
-* Support for Logit models with availability constraints
+* Symbolic utility specification using `Parameter`, `Variable` and `Draw`
+* Four models, all with availability constraints: `LogitModel`, `MixedLogitModel`,
+  `NestedLogitModel` and `LatentClassModel` (whose classes may be any of the other
+  three, including Mixed Logit)
 * Native compatibility with `DataFrames.jl`
-* Estimation routines powered by `Optim.jl` (analytic or automatic differentiation)
-* Modular design enabling future models like Mixed Logit, RRM, etc.
+* Maximum likelihood via `Optim.jl` (BFGS), with exact forward-mode `ForwardDiff`
+  gradients and Hessians. `estimate(...; hessian_method = :fd)` switches the
+  Hessian to a finite-difference Jacobian of that exact gradient, as Apollo does
+* Classical and robust (sandwich) standard errors reported side by side, with the
+  Hessian and BHHH matrices classified at the optimum rather than assumed sound
+* Delta-method standard errors for derived quantities (WTP, elasticities) on all
+  four models, via `evaluate(expressions, model, results)`
 
 ## Example
 
@@ -30,18 +37,23 @@ results = estimate(model, :choice)
 P = predict(model, results)
 ```
 
-## Submodules
+## Files
 
-* `Expressions.jl`: symbolic expressions (sum, multiplication, exp, etc.)
-* `Utils.jl`: utilities for model construction (parameter collection, updates)
-* `Models.jl`: base model type and model-specific definitions
+Included in dependency order, which is why it is also the order they are listed in:
+
+* `Expressions.jl`: the symbolic nodes (sum, product, exp, power, …) and the two
+  `evaluate` paths — cross-sectional, and the `N × R` draws path
+* `Utils.jl`: tree walkers, the shared alternatives/estimation-space/standard-error
+  machinery, the delta method, and console + Excel reporting
+* `Draws.jl`: draw generation for Mixed Logit (`:normal`, `:uniform`, `:halton`, `:mlhs`)
+* `Models.jl`: the `DiscreteChoiceModel` base type, then the four model files
 
 ## Exports
 
-User-facing types and functions, including:
-
-* `Parameter`, `Variable`
-* `LogitModel`, `estimate`, `predict`
+* `Parameter`, `Variable`, `Draw`, `evaluate`
+* `LogitModel`, `MixedLogitModel`, `NestedLogitModel`, `LatentClassModel`, `Nest`
+* `estimate`, `predict`, `loglikelihood`
+* `summarize_results`, `summarize_expressions`, `generate_draws`, `Draws`
 
 ## License
 

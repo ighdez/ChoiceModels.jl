@@ -1,8 +1,9 @@
-"""
-Implementation of the LogitModel type and estimation methods.
-
-This module defines the LogitModel struct and all associated functions required to estimate, update, and predict a multinomial logit model. Built on top of the symbolic utilities defined in Expressions.jl.
-"""
+# Implementation of the LogitModel type and its estimation methods: the struct, the
+# probabilities, the likelihood, `estimate`, `predict`, and the delta-method
+# `evaluate`. Built on the symbolic expressions defined in `Expressions.jl`.
+#
+# A plain comment rather than a docstring: there is no binding here for it to
+# attach to, so as a string literal it documented nothing.
 
 using DataFrames
 
@@ -68,14 +69,24 @@ end
 """
 Computes choice probabilities under the Multinomial Logit model.
 
+Uses the numerically stable softmax — the per-row maximum utility is subtracted
+before exponentiating. That is algebraically the same ratio, but without it extreme
+utilities underflow every `exp(u)` to zero and the normalization collapses to `0/0`;
+see the softmax bullet in CLAUDE.md for what that cost when it was missing here.
+
 # Arguments
-- `utilities`: vector of symbolic utility expressions
+- `utilities`: vector of symbolic utility expressions, in the alternatives' order
 - `data`: `DataFrame` of observed variables
+- `availability`: vector of boolean vectors, in the alternatives' order, marking
+  which alternatives are available for each observation
 - `parameters`: dictionary mapping parameter names to values
-- `availability`: vector of boolean vectors indicating available alternatives for each observation
+
+Note the argument order — `availability` before `parameters` — which differs from
+the Mixed Logit `logit_prob` in `MixedLogit.jl`.
 
 # Returns
-- `Vector{Vector{Float64}}`: each inner vector contains probabilities for all alternatives for one observation
+- An `N × J` matrix of choice probabilities, `0` for unavailable alternatives. The
+  element type follows `parameters`, so it is a ForwardDiff `Dual` during estimation.
 """
 function logit_prob(
     utilities::Vector{<:DCMExpression},
@@ -136,7 +147,8 @@ Computes predicted probabilities using estimated parameters.
 - `results::NamedTuple`: output of `estimate`, must include `parameters`
 
 # Returns
-- `Vector{Vector{Float64}}`: predicted probabilities for each observation
+- `Matrix{Float64}`: `N × J` matrix of predicted probabilities, in the model's
+  `alternatives` order
 """
 function predict(model::LogitModel,results::NamedTuple)
     probs = logit_prob(
@@ -151,12 +163,23 @@ end
 """
 Computes the log-likelihood of the model given observed choices.
 
+Returns the contributions rather than their sum: `estimate` needs the per-contribution
+vector for the score Jacobian behind the robust and BHHH covariance matrices, and sums
+it itself for the objective.
+
 # Arguments
 - `model::LogitModel`: model object with defined parameters
-- `choices::Vector{Int}`: vector with indices of chosen alternatives for each observation
+- `choices::Vector{Int}`: **positions** of the chosen alternatives in the model's
+  `alternatives` order — not the raw codes from the choice column. `estimate`
+  translates them once via `_recode_choices`
+- `parameters::Dict = model.parameters`: values to evaluate at. `estimate` passes the
+  dict its objective closures write into, so this is where the optimizer's current θ
+  (and, during differentiation, ForwardDiff `Dual`s) enters
 
 # Returns
-- `Vector{Float64}`: log-likelihood contribution per observation
+- `Vector`: log-likelihood contribution per observation. This model is
+  per-observation by construction — see item 3 of the TODO section in CLAUDE.md for
+  why it has no `idvar` and why its robust standard errors are not clustered
 """
 function loglikelihood(model::LogitModel, choices::Vector{Int}; parameters::Dict = model.parameters)
     probs = logit_prob(
@@ -222,7 +245,7 @@ Uses `Optim.jl` to minimize the negative log-likelihood. Computes standard error
 
 # Returns
 - `NamedTuple` containing:
-    - `parameters`: estimated values
+    - `parameters`: estimated values, free and fixed alike, keyed by name
     - `std_errors`: classical standard errors
     - `rob_std_errors`: robust standard errors (White)
     - `bhhh_std_errors`: BHHH/OPG standard errors — returned for completeness but
@@ -234,9 +257,17 @@ Uses `Optim.jl` to minimize the negative log-likelihood. Computes standard error
     - `bhhh_matrix`: `bhhh_matrix_status` verdict for `G` (`:posdef`/`:singular`)
     - `free_parameters`: number of free parameters
     - `loglikelihood`: log-likelihood at optimum
+    - `null_loglikelihood`: equal-probability-over-available-alternatives benchmark,
+      for McFadden's ρ²
     - `iters`: number of iterations
     - `converged`: convergence status
-    - `estimation_time`: time taken (in seconds)
+    - `estimation_time`: time taken (in seconds), measured from the end of the
+      ForwardDiff warm-up so that compilation is not charged to it
+    - `N`: number of observations
+    - `result`: the raw `Optim` result object
+
+The covariance matrices are ordered by the free parameters as `collect_parameters`
+returns them (first-seen traversal order); `delta_method` relies on that alignment.
 
 Every covariance and standard error field above is `nothing` when `bhhh_matrix`
 is `:singular` — no covariance matrix is computed at all in that case.
