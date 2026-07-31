@@ -448,6 +448,9 @@ Uses optimization via `Optim.jl` to minimize the negative simulated log-likeliho
 - `model::MixedLogitModel`: model specification with draws and utility functions
 - `choicevar::Symbol`: name of the column in `model.data` that contains observed choices
 - `verbose::Bool = true`: whether to print optimizer output
+- `hessian_method::Symbol=:ad`: how to compute the Hessian the covariance matrices are
+  built from — `:ad` for exact ForwardDiff second derivatives, `:fd` for a finite-difference
+  Jacobian of the exact gradient (Apollo's routine). See `model_hessian!`
 
 # Returns
 - `NamedTuple` with fields:
@@ -461,8 +464,12 @@ Uses optimization via `Optim.jl` to minimize the negative simulated log-likeliho
     - `converged`: whether the optimizer converged
     - `estimation_time`: total runtime in seconds
 """
-function estimate(model::MixedLogitModel, choicevar::Symbol; verbose::Bool = true)
-    
+function estimate(model::MixedLogitModel, choicevar::Symbol; verbose::Bool = true,
+                  hessian_method::Symbol = :ad)
+    # Validate before optimizing, not after: a typo'd method should not cost a full
+    # estimation run before it is reported.
+    _check_hessian_method(hessian_method)
+
     choice_data = model.data[:,choicevar]
 
     # Translate the analyst's alternative codes into positions in `model.alternatives`
@@ -525,7 +532,7 @@ function estimate(model::MixedLogitModel, choicevar::Symbol; verbose::Bool = tru
     # Warm-up automatic differentiation
     H = zeros(length(θ0), length(θ0))
     cfg = _hessian_config(f_obj, θ0)
-    H = ForwardDiff.hessian!(H, f_obj, θ0, cfg)
+    H = model_hessian!(H, f_obj, θ0, cfg, hessian_method)
     
     ForwardDiff.gradient(f_obj, θ0)
     
@@ -571,7 +578,7 @@ function estimate(model::MixedLogitModel, choicevar::Symbol; verbose::Bool = tru
         println("Computing Standard Errors")
     end
 
-    ForwardDiff.hessian!(H, f_obj, θ̂, cfg)
+    model_hessian!(H, f_obj, θ̂, cfg, hessian_method)
 
     # `covariance_estimates` builds all three estimators at once (classical,
     # sandwich, BHHH/OPG), so the score Jacobian must be ready before it is

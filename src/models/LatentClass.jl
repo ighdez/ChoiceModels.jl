@@ -718,7 +718,11 @@ end
 # `Utils.jl`.
 _children(m::LatentClassModel) = (m.expr,)
 
-function estimate(model::LatentClassModel, choicevar::Symbol; verbose::Bool = true)
+function estimate(model::LatentClassModel, choicevar::Symbol; verbose::Bool = true,
+                  hessian_method::Symbol = :ad)
+    # Validate before optimizing, not after: a typo'd method should not cost a full
+    # estimation run before it is reported.
+    _check_hessian_method(hessian_method)
 
     # Parameter setup
     params = collect_parameters(model.expr)
@@ -790,7 +794,7 @@ function estimate(model::LatentClassModel, choicevar::Symbol; verbose::Bool = tr
     # Warm-up automatic differentiation
     H = zeros(length(θ0), length(θ0))
     cfg = _hessian_config(f_obj, θ0)
-    H = ForwardDiff.hessian!(H, f_obj, θ0, cfg)
+    H = model_hessian!(H, f_obj, θ0, cfg, hessian_method)
     
     ForwardDiff.gradient(f_obj, θ0)
     
@@ -853,7 +857,7 @@ function estimate(model::LatentClassModel, choicevar::Symbol; verbose::Bool = tr
         println("Computing Standard Errors...")
     end
 
-    ForwardDiff.hessian!(H, f_obj, θ̂, cfg)
+    model_hessian!(H, f_obj, θ̂, cfg, hessian_method)
 
     # `covariance_estimates` builds all three estimators at once (classical,
     # sandwich, BHHH/OPG), so the score Jacobian must be ready before it is

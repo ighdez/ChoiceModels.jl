@@ -560,6 +560,74 @@ not exceed the input length. This form clamps.
 """
 _hessian_config(f, θ0) = ForwardDiff.HessianConfig(f, θ0, ForwardDiff.Chunk(θ0, 2))
 
+"""
+    _check_hessian_method(method::Symbol) -> Symbol
+
+Validates the `hessian_method` keyword shared by all four `estimate` functions.
+Throws on anything but `:ad` or `:fd`, naming both — a typo'd method must not
+silently fall through to a default.
+"""
+function _check_hessian_method(method::Symbol)
+    method in (:ad, :fd) || error("""
+          Unknown `hessian_method = :$method`. Valid choices are `:ad` (the default — exact \
+          second derivatives by nested-dual ForwardDiff) and `:fd` (a finite-difference \
+          Jacobian of the exact ForwardDiff gradient, which is what Apollo does).
+          """)
+    return method
+end
+
+"""
+    model_hessian!(H, f_obj, θ, cfg, method) -> H
+
+Fills `H` with the Hessian of `f_obj` at `θ`, by whichever route `method` selects.
+Shared by all four `estimate` functions so the two never drift apart.
+
+- `:ad` (default) — `ForwardDiff.hessian!` through `cfg`, i.e. exact second
+  derivatives with the small chunk `_hessian_config` sets. This is the reference.
+- `:fd` — `FiniteDiff.finite_difference_jacobian` of the **exact ForwardDiff
+  gradient**. Note what is and is not approximated: the gradient is still analytic
+  to machine precision, and only the outer differentiation is numerical. This is
+  Apollo's `hessianRoutine = "analytic"`, which its own log describes as
+  "Computing covariance matrix using numerical jacobian of analytical gradient",
+  and it is a single finite difference rather than a double one.
+
+  `FiniteDiff`'s default scheme is **forward**, not central — `K+1` gradient
+  evaluations rather than `2K`, with truncation error `O(√eps) ≈ 1.5e-8` rather
+  than `O(eps^(2/3))`. That is deliberate and is where the speed comes from; it is
+  also the exact recipe item 3's measurements were taken on, so switching to
+  central would invalidate them and roughly double the cost of the option.
+
+**The FD Jacobian is symmetrized here, and that is not cosmetic.** A true Hessian
+is symmetric; the raw FD Jacobian of a gradient is not, measured at 7.7e-7 on
+`MXL_swissmetro`. `hessian_status` takes an eigendecomposition, and a
+non-symmetric matrix can hand back complex eigenvalues, which would make the
+`:posdef`/`:indefinite`/`:singular` verdict meaningless rather than merely noisy.
+`(J + J')/2` is the nearest symmetric matrix in the Frobenius sense.
+
+**Why `:ad` remains the default.** Measured on `MXL_swissmetro` at `R = 250`, `:fd`
+is 1.9× faster on the Hessian (1.29s vs 2.41s) with peak RSS a wash, and agrees to
+1.6e-6 relative on standard errors. But the Hessian is only ~24% of estimation
+time, so the ceiling is ~12%, and against that `:fd` costs exactness. The specific
+risk is that `hessian_status`/`bhhh_matrix_status` use an **empirical** `rtol=1e-10`
+eigenvalue test calibrated to AD-level roundoff. On a deterministic unidentified
+model FD is comfortably inside it (its zero eigenvalue came out at 3.4e-14 against
+a 2.0e-8 threshold, and both routes returned `:singular`), but on a **singular
+simulated** likelihood the measured 1.15e-5 relative Hessian error against a λmax
+of ~273 is ~3e-3 absolute — far above the threshold. So `:fd` is offered, not
+imposed: prefer it when the Hessian dominates a profile, and check the reported
+`Hessian at optimum` line rather than assuming the verdict transfers.
+"""
+function model_hessian!(H, f_obj, θ, cfg, method::Symbol)
+    _check_hessian_method(method)
+    if method === :ad
+        ForwardDiff.hessian!(H, f_obj, θ, cfg)
+    else
+        J = FiniteDiff.finite_difference_jacobian(x -> ForwardDiff.gradient(f_obj, x), θ)
+        H .= (J .+ J') ./ 2
+    end
+    return H
+end
+
 # ---------------------------------------------------------------------------
 # Shared standard-error machinery
 #

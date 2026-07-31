@@ -368,4 +368,139 @@ end
         @test results.std_errors[:β] != results.bhhh_std_errors[:β]
     end
 
+    # -----------------------------------------------------------------------
+    # `hessian_method = :ad | :fd`
+    #
+    # `:fd` mirrors Apollo's `hessianRoutine`: a finite-difference Jacobian of the
+    # EXACT ForwardDiff gradient, not a double finite difference. `:ad` stays the
+    # default; see `model_hessian!` for why (the Hessian is ~24% of estimation
+    # time, and the `rtol=1e-10` eigenvalue tests are calibrated to AD roundoff).
+    # -----------------------------------------------------------------------
+    @testset "hessian_method selects the Hessian route" begin
+        Random.seed!(20260804)
+        N = 600
+        df = DataFrame(t1 = 2 .+ randn(N), t2 = 2 .+ randn(N),
+                       c1 = 2 .+ randn(N), c2 = 2 .+ randn(N))
+        v1 = -1.0 .* df.t1 .- 0.5 .* df.c1
+        v2 = -1.0 .* df.t2 .- 0.5 .* df.c2
+        p1 = 1 ./ (1 .+ exp.(v2 .- v1))
+        df.CHOICE = [rand() < p1[n] ? 1 : 2 for n in 1:N]
+
+        bt = Parameter(:bt, value = -0.5)
+        bc = Parameter(:bc, value = -0.2)
+        model = LogitModel((a = 1, b = 2);
+                           utilities = (a = bt * Variable(:t1) + bc * Variable(:c1),
+                                        b = bt * Variable(:t2) + bc * Variable(:c2)),
+                           data = df)
+
+        r_ad = estimate(model, :CHOICE; verbose = false)
+        r_fd = estimate(model, :CHOICE; verbose = false, hessian_method = :fd)
+
+        # The Hessian route cannot touch the optimizer: BFGS works from gradients,
+        # which are exact either way. Same optimum, same path, same iterations.
+        @test r_fd.loglikelihood ≈ r_ad.loglikelihood
+        @test r_fd.iters == r_ad.iters
+        @test r_fd.parameters[:bt] ≈ r_ad.parameters[:bt]
+
+        # Standard errors agree closely but are NOT identical — this is a different
+        # numerical route, and asserting equality would be asserting the feature
+        # does nothing. CLAUDE.md item 3 measured 1.6e-6 relative on a Mixed Logit.
+        for k in (:bt, :bc)
+            @test r_fd.std_errors[k] ≈ r_ad.std_errors[k] rtol = 1e-4
+            @test r_fd.rob_std_errors[k] ≈ r_ad.rob_std_errors[k] rtol = 1e-4
+        end
+        @test r_fd.std_errors[:bt] != r_ad.std_errors[:bt]
+
+        # The FD Jacobian of a gradient is NOT symmetric (measured at 7.7e-7), and
+        # `hessian_status` eigendecomposes it — a non-symmetric matrix can return
+        # COMPLEX eigenvalues and make the verdict meaningless rather than noisy.
+        # `model_hessian!` symmetrizes for this reason; assert it stuck.
+        @test issymmetric(r_fd.vcov)
+        @test r_fd.hessian === r_ad.hessian === :posdef
+        @test r_fd.bhhh_matrix === :posdef
+
+        # An unknown method throws, and does so BEFORE optimizing.
+        @test_throws ErrorException estimate(model, :CHOICE; verbose = false,
+                                             hessian_method = :nope)
+        err = try
+            estimate(model, :CHOICE; verbose = false, hessian_method = :numderiv)
+            ""
+        catch e
+            e.msg
+        end
+        @test occursin(":ad", err) && occursin(":fd", err)
+    end
+
+    @testset "hessian_method: :fd agrees with :ad in log-lambda space" begin
+        # The Nested Logit is the one model whose estimation space differs from its
+        # reporting space (θ = log λ). `model_hessian!` is handed the objective in
+        # ESTIMATION space, and `curvature_in_model_space` converts afterwards — so
+        # this checks the FD route goes through the same conversion rather than
+        # reporting a θ-space standard error for λ.
+        Random.seed!(20260805)
+        N = 900
+        df = DataFrame(x1 = randn(N), x2 = randn(N), x3 = randn(N))
+        v = [-0.8 .* df.x1, -0.8 .* df.x2 .+ 0.3, -0.8 .* df.x3 .+ 0.1]
+        λ_true = 0.6
+        df.CHOICE = map(1:N) do n
+            iv = λ_true * log(exp(v[2][n] / λ_true) + exp(v[3][n] / λ_true))
+            if rand() > exp(iv) / (exp(v[1][n]) + exp(iv))
+                1
+            else
+                p2 = exp(v[2][n] / λ_true) / (exp(v[2][n] / λ_true) + exp(v[3][n] / λ_true))
+                rand() < p2 ? 2 : 3
+            end
+        end
+
+        β  = Parameter(:β,  value = -0.5)
+        a2 = Parameter(:a2, value = 0.0)
+        a3 = Parameter(:a3, value = 0.0)
+        λ  = Parameter(:λ_nest, value = 1.0)
+        model = NestedLogitModel((one = 1, two = 2, three = 3);
+                                 utilities = (one = β * Variable(:x1),
+                                              two = β * Variable(:x2) + a2,
+                                              three = β * Variable(:x3) + a3),
+                                 data = df,
+                                 tree = [:one, Nest(λ, [:two, :three])])
+
+        r_ad = estimate(model, :CHOICE; verbose = false)
+        r_fd = estimate(model, :CHOICE; verbose = false, hessian_method = :fd)
+
+        @test r_fd.parameters[:λ_nest] ≈ r_ad.parameters[:λ_nest]
+        @test r_fd.std_errors[:λ_nest] ≈ r_ad.std_errors[:λ_nest] rtol = 1e-4
+        @test r_fd.rob_std_errors[:λ_nest] ≈ r_ad.rob_std_errors[:λ_nest] rtol = 1e-4
+        @test r_fd.hessian === r_ad.hessian
+    end
+
+    @testset "hessian_method: :fd reaches the same singularity verdict" begin
+        # This is the gate CLAUDE.md item 3 named before FD could be offered at
+        # all: `hessian_status` uses an EMPIRICAL `rtol=1e-10` eigenvalue test
+        # calibrated to AD-level roundoff, so the question was whether FD's coarser
+        # Hessian blurs an exact zero eigenvalue past the threshold and turns a
+        # correctly-diagnosed unidentified model into a confident wrong answer.
+        # The same two-free-ASC model as above; measured, FD's zero eigenvalue came
+        # out at 3.4e-14 against a 2.0e-8 threshold. It is a DETERMINISTIC
+        # likelihood — the untested case remains a singular *simulated* one, which
+        # is why `:ad` stays the default.
+        Random.seed!(99)
+        N = 300
+        x1, x2 = randn(N), randn(N)
+        choices = [rand() < 1 / (1 + exp(-0.8 * (x2[n] - x1[n]) - 0.5)) ? 1 : 2 for n in 1:N]
+        df = DataFrame(x1 = x1, x2 = x2, CHOICE = choices)
+
+        asc1 = Parameter(:asc1, value = 0.0)
+        asc2 = Parameter(:asc2, value = 0.0)
+        b    = Parameter(:b,    value = 0.0)
+        model = LogitModel([1, 2];
+                           utilities = [asc1 + b * Variable(:x1), asc2 + b * Variable(:x2)],
+                           availability = [trues(N), trues(N)], data = df)
+
+        r_fd = @test_logs (:warn,) match_mode=:any estimate(model, :CHOICE; verbose = false,
+                                                            hessian_method = :fd)
+        @test r_fd.converged
+        @test r_fd.hessian === :singular
+        @test r_fd.bhhh_matrix === :singular
+        @test r_fd.vcov === nothing
+    end
+
 end
