@@ -408,7 +408,7 @@ function estimate(model::MixedLogitModel, choicevar::Symbol; verbose::Bool = tru
     
     # Warm-up automatic differentiation
     H = zeros(length(θ0), length(θ0))
-    cfg = ForwardDiff.HessianConfig(f_obj, θ0)
+    cfg = _hessian_config(f_obj, θ0)
     H = ForwardDiff.hessian!(H, f_obj, θ0, cfg)
     
     ForwardDiff.gradient(f_obj, θ0)

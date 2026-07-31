@@ -503,6 +503,34 @@ function curvature_in_model_space(
     return Dinv * H * Dinv, Dinv * G * Dinv
 end
 
+"""
+The `ForwardDiff` Hessian configuration every model's `estimate` uses.
+
+The chunk size is deliberately small, and it is a **memory** decision rather than a
+speed one. Under `ForwardDiff.hessian` the working elements are nested duals —
+`Dual{Tag, Dual{Tag, Float64, C}, C}` — so a single value occupies `(1+C)^2 * 8`
+bytes: **648** at the default `C = K = 8`, against **72** at `C = 2`. In a Mixed
+Logit that element size multiplies the whole `N x J x R` probability tensor, and it
+is the sole reason large draw counts exhaust memory here while Apollo and Biogeme
+are untroubled by them — they use numerical and analytical derivatives, so their
+tensor elements are plain `Float64` at 8 bytes.
+
+Measured on `MXL_swissmetro` at `R = 250`: peak resident memory **11.53 GB** at the
+default chunk against **3.18 GB** here, in the **same wall time** — the extra passes
+are offset by better cache locality. The resulting Hessian is **bitwise identical**
+(`max|H_8 - H_2| = 0.0`, likewise for `Chunk{1}`), so no standard error moves.
+
+Note BFGS itself never needs any of this: it works from gradients, whose elements
+are `Dual{Float64,K}` at 72 bytes. The peak comes entirely from the two
+`ForwardDiff.hessian!` calls each `estimate` makes through this config — the
+warm-up at θ₀ and the real one at θ̂.
+
+`ForwardDiff.Chunk(θ0, 2)` rather than `ForwardDiff.Chunk{2}()`: the latter throws
+an `AssertionError` when the model has a single free parameter, since the chunk may
+not exceed the input length. This form clamps.
+"""
+_hessian_config(f, θ0) = ForwardDiff.HessianConfig(f, θ0, ForwardDiff.Chunk(θ0, 2))
+
 # ---------------------------------------------------------------------------
 # Shared standard-error machinery
 #
