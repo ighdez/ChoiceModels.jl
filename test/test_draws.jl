@@ -17,7 +17,7 @@ using Distributions: Normal, quantile
 
     @testset "marginals: $scheme" for scheme in schemes
         Random.seed!(987)
-        d = generate_draws(dims, N, R; scheme=scheme)
+        d = ChoiceModels.generate_draws(dims, N, R; scheme=scheme)
 
         @test d.scheme == scheme
         @test d.R == R
@@ -35,7 +35,7 @@ using Distributions: Normal, quantile
 
     @testset "cross-dimensional independence: $scheme" for scheme in schemes
         Random.seed!(987)
-        d = generate_draws(dims, N, R; scheme=scheme)
+        d = ChoiceModels.generate_draws(dims, N, R; scheme=scheme)
 
         for (a, b) in ((:d1, :d2), (:d1, :d3), (:d2, :d3))
             ρ = cor(vec(d.values[a]), vec(d.values[b]))
@@ -58,7 +58,7 @@ using Distributions: Normal, quantile
     end
 
     @testset "unsupported scheme errors" begin
-        @test_throws ErrorException generate_draws([:d1], 10, 10; scheme=:not_a_scheme)
+        @test_throws ErrorException ChoiceModels.generate_draws([:d1], 10, 10; scheme=:not_a_scheme)
     end
 
 end

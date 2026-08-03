@@ -210,14 +210,13 @@ Represents a data variable used in utility expressions.
 
 # Fields
 - `name::Symbol`: name of the variable, which must match a column of the model's data
-- `index::Union{Nothing, Int}`: reserved, and currently inert. Both `evaluate`
-  paths read the column as `data[:, name]` and never consult this field, so
-  setting it changes nothing. Panel structure is carried by the models' `idvar`
-  instead (`MixedLogitModel`, `LatentClassModel`), not here.
+
+Panel structure is carried by the models' `idvar` (`MixedLogitModel`,
+`LatentClassModel`), never by the node: both `evaluate` paths read the column as
+`data[:, name]` and a variable means the same thing wherever it appears.
 """
 struct DCMVariable <: DCMExpression
     name::Symbol
-    index::Union{Nothing, Int}  # For panel/individual data
 end
 
 """
@@ -225,14 +224,12 @@ Constructor for `DCMVariable`.
 
 # Arguments
 - `name::Symbol`: variable name (must match column name in data)
-- `index=nothing`: stored on the node but not used by either evaluation path; see
-  `DCMVariable`
 
 # Returns
 - `DCMVariable` object
 """
-function Variable(name::Symbol; index=nothing)
-    return DCMVariable(name, index)
+function Variable(name::Symbol)
+    return DCMVariable(name)
 end
 
 

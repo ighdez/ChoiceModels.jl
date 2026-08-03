@@ -1,6 +1,13 @@
-using Random, Distributions, Sobol, StatsBase
+using Random, Distributions, Statistics
 
-export Draws, generate_draws
+# Deliberately NOT exported. Both are internal machinery the model constructors
+# drive — `MixedLogitModel` generates its own draws and `_lc_share_draws` takes
+# that over for a latent class, so a user never calls `generate_draws` and never
+# holds a `Draws` (it is unpacked into a plain `Dict` at construction). Exporting
+# them would commit the signature under semver, and it has already changed shape
+# once: Halton bases are assigned by a dimension's POSITION in `param_names`.
+# Same treatment as `logit_prob`, `chosen_logprob`, `covariance_estimates`,
+# `hessian_status` and `bhhh_matrix_status`; reach them as `ChoiceModels.foo`.
 
 """
 Struct to hold simulation draws used for random parameters in Mixed Logit models.

@@ -1,4 +1,4 @@
-using DataFrames, StatsBase
+using DataFrames, Statistics
 
 """
 Structure for a Mixed Logit model, allowing for random taste variation.

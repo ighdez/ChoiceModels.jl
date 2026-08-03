@@ -53,7 +53,10 @@ Included in dependency order, which is why it is also the order they are listed 
 * `Parameter`, `Variable`, `Draw`, `evaluate`
 * `LogitModel`, `MixedLogitModel`, `NestedLogitModel`, `LatentClassModel`, `Nest`
 * `estimate`, `predict`, `loglikelihood`
-* `summarize_results`, `summarize_expressions`, `generate_draws`, `Draws`
+* `summarize_results`, `summarize_expressions`
+
+Draw generation (`Draws`, `generate_draws`) is internal and deliberately not
+exported — the model constructors drive it; reach it as `ChoiceModels.generate_draws`.
 
 ## License
 
@@ -64,7 +67,7 @@ module ChoiceModels
 
 __precompile__()
 
-using Optim, LineSearches, DataFrames, ForwardDiff, FiniteDiff, LinearAlgebra, Distributions, Printf, XLSX, Base.Threads, StatsBase, Primes
+using Optim, LineSearches, DataFrames, ForwardDiff, FiniteDiff, LinearAlgebra, Distributions, Printf, XLSX, Base.Threads, Statistics, Primes
 
 include("Expressions.jl")
 include("Utils.jl")
